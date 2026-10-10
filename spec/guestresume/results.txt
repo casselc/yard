@@ -1,0 +1,51 @@
+quint 0.32.0, seed 0x5eed, steps 200, samples 20000 (design) / 20000 (mutants)
+sim   design                 noStaleWork         20000 x 200 ok       (expect ok      )   71.4s 
+sim   design                 atMostOncePerKey    20000 x 200 ok       (expect ok      )   57.6s (per VM instance: a clone of a mid-run snapshot finishes that run again)
+sim   design                 recordHonest        20000 x 200 ok       (expect ok      )   59.3s 
+sim   design                 entropyHonest       20000 x 200 ok       (expect ok      )   58.3s 
+wit   design wRun was witnessed in 9280 trace(s) out of 20000 explored (46.40%)
+wit   design wHostRestoreRun was witnessed in 9155 trace(s) out of 20000 explored (45.77%)
+wit   design wCloneRun was witnessed in 283 trace(s) out of 20000 explored (1.42%)
+wit   design wLostNotifyRun was witnessed in 515 trace(s) out of 20000 explored (2.57%)
+wit   design wDupIgnored was witnessed in 7573 trace(s) out of 20000 explored (37.87%)
+wit   design wStaleRejected was witnessed in 5905 trace(s) out of 20000 explored (29.53%)
+wit   design wRefused was witnessed in 20000 trace(s) out of 20000 explored (100.00%)
+wit   design wWorkAfterRun was witnessed in 4473 trace(s) out of 20000 explored (22.36%)
+wit   design wRecheckRun was witnessed in 4852 trace(s) out of 20000 explored (24.26%)
+wit   design wSvcTimeout was witnessed in 4425 trace(s) out of 20000 explored (22.13%)
+wit   design wTwoClones was witnessed in 22 trace(s) out of 20000 explored (0.11%)
+wit   design wEntRetry was witnessed in 8358 trace(s) out of 20000 explored (41.79%)
+wit   design wOtherReseed was witnessed in 9677 trace(s) out of 20000 explored (48.38%)
+sim   actOnlyOnEpoch         noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.6s a clone (no epoch bump)
+sim   actOnlyOnGen           noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s a lost notify
+sim   epochNotMonotonic      atMostOncePerKey    20000 x 200 VIOLATED (expect VIOLATED)   21.0s a stale HELLO re-runs a done key
+sim   noDedupe               atMostOncePerKey    20000 x 200 VIOLATED (expect VIOLATED)    2.0s a duplicate notify re-runs a done key
+sim   acceptWhileResuming    noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s 
+sim   skipEntropy            noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.6s needs a lost notify (the kernel's vmgenid mix covers the rest)
+sim   servicesBeforeEntropy  noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.6s 
+sim   staleReply             noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.8s 
+sim   clearOnComplete        noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s 
+sim   timeoutIgnored         noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.7s 
+sim   timeoutCountsDone      recordHonest        20000 x 200 VIOLATED (expect VIOLATED)    1.5s 
+sim   keyFromSeen            noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    6.3s finding: was the first design
+sim   notifyLostOnClone      noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s finding behind assumption A1
+sim   entropyDoneEarly       entropyHonest       20000 x 200 VIOLATED (expect VIOLATED)    1.5s done before a reseed took the bytes
+sim   entropyDoneEarly       noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s ...and a service seeds from the stale RNG
+sim   entropyFailOpen        noStaleWork         20000 x 200 VIOLATED (expect VIOLATED)    1.5s failed writes open the gate
+runs  design                 DesignTest$                          passed 20 failed 0 (expect all-pass)
+runs  actOnlyOnEpoch         ^actOnlyOnEpochBreaksTest$           passed 1 failed 0 (expect all-pass)
+runs  actOnlyOnGen           ^actOnlyOnGenBreaksTest$             passed 1 failed 0 (expect all-pass)
+runs  epochNotMonotonic      ^epochNotMonotonicBreaksTest$        passed 1 failed 0 (expect all-pass)
+runs  noDedupe               ^noDedupeBreaksTest$                 passed 1 failed 0 (expect all-pass)
+runs  acceptWhileResuming    ^acceptWhileResumingBreaksTest$      passed 1 failed 0 (expect all-pass)
+runs  skipEntropy            ^skipEntropyBreaksTest$              passed 1 failed 0 (expect all-pass)
+runs  servicesBeforeEntropy  ^servicesBeforeEntropyBreaksTest$    passed 1 failed 0 (expect all-pass)
+runs  staleReply             ^staleReplyBreaksTest$               passed 1 failed 0 (expect all-pass)
+runs  clearOnComplete        ^clearOnCompleteBreaksTest$          passed 1 failed 0 (expect all-pass)
+runs  timeoutIgnored         ^timeoutIgnoredBreaksTest$           passed 1 failed 0 (expect all-pass)
+runs  timeoutCountsDone      ^timeoutCountsDoneBreaksTest$        passed 1 failed 0 (expect all-pass)
+runs  keyFromSeen            ^keyFromSeenBreaksTest$              passed 1 failed 0 (expect all-pass)
+runs  notifyLostOnClone      ^notifyLostOnCloneBreaksTest$        passed 1 failed 0 (expect all-pass)
+runs  entropyDoneEarly       ^entropyDoneEarlyBreaksTest$         passed 1 failed 0 (expect all-pass)
+runs  entropyFailOpen        ^entropyFailOpenBreaksTest$          passed 1 failed 0 (expect all-pass)
+failures: 0
