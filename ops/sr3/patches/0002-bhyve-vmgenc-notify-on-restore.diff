@@ -1,0 +1,192 @@
+bhyve: snapshot the ACPI PM/GPE0 state and notify the guest of a new VM generation on restore
+
+Against FreeBSD stable/15 fabb224f2f15 plus 0001 (independent files; applies with patch -p1).
+
+1. amd64/pm.c had no snapshot hook: PM1 enable/status/control and GPE0 enable/status came back as
+   0 after a restore, so no GPE could raise an SCI, and the SIGTERM power-button handler that
+   BHYVE_ACPI_ENABLE installs was missing (kill -TERM no longer powers a restored guest off).
+   pm_snapshot() saves/restores them as device "pm" (restore tolerates older snapshots without it)
+   and re-installs the power-button handler when SCI_EN was set.
+2. vmgenc_restore(): after devices, PM state and kernel state (vatpic/vioapic) are restored and
+   before any vCPU runs, write a fresh generation ID and raise GPE_VMGENC; the guest's _E00 method
+   notifies \_SB.GENC (0x80). This is the "XXX When we have suspend/resume/rollback" left in
+   vmgenc_init(). A live checkpoint does not call it.
+
+--- a/usr.sbin/bhyve/amd64/pm.c
++++ b/usr.sbin/bhyve/amd64/pm.c
+@@ -29,6 +29,9 @@
+ 
+ #include <sys/types.h>
+ #include <machine/vmm.h>
++#ifdef BHYVE_SNAPSHOT
++#include <machine/vmm_snapshot.h>
++#endif
+ 
+ #include <assert.h>
+ #include <errno.h>
+@@ -43,6 +46,7 @@
+ #include "pci_lpc.h"
+ 
+ static pthread_mutex_t pm_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct vmctx *pm_ctx;
+ static struct mevent *power_button;
+ static sig_t old_power_handler;
+ 
+@@ -373,4 +377,40 @@
+ 	 */
+ 	pci_irq_use(SCI_INT);
+ 	vm_isa_set_irq_trigger(ctx, SCI_INT, LEVEL_TRIGGER);
++	pm_ctx = ctx;
+ }
++
++#ifdef BHYVE_SNAPSHOT
++/*
++ * Save/restore the ACPI PM1 and GPE0 registers.  Without this a restored
++ * guest has PM1/GPE0 enables of 0 (no SCI for any GPE, e.g. the VM
++ * generation counter) and, since ACPI was enabled before the snapshot, no
++ * SIGTERM power-button handler either.  sci_active mirrors the SCI pin
++ * level, which the kernel snapshot (vatpic/vioapic) restores.
++ */
++int
++pm_snapshot(struct vm_snapshot_meta *meta)
++{
++	int ret;
++
++	pthread_mutex_lock(&pm_lock);
++	SNAPSHOT_VAR_OR_LEAVE(pm1_enable, meta, ret, done);
++	SNAPSHOT_VAR_OR_LEAVE(pm1_status, meta, ret, done);
++	SNAPSHOT_VAR_OR_LEAVE(pm1_control, meta, ret, done);
++	SNAPSHOT_VAR_OR_LEAVE(gpe0_enabled, meta, ret, done);
++	SNAPSHOT_VAR_OR_LEAVE(gpe0_active, meta, ret, done);
++	SNAPSHOT_VAR_OR_LEAVE(sci_active, meta, ret, done);
++
++	if (meta->op == VM_SNAPSHOT_RESTORE &&
++	    (pm1_control & PM1_SCI_EN) != 0 && power_button == NULL) {
++		/* As smi_cmd_handler() does on BHYVE_ACPI_ENABLE. */
++		power_button = mevent_add(SIGTERM, EVF_SIGNAL,
++		    power_button_handler, pm_ctx);
++		old_power_handler = signal(SIGTERM, SIG_IGN);
++	}
++
++done:
++	pthread_mutex_unlock(&pm_lock);
++	return (ret);
++}
++#endif
+--- a/usr.sbin/bhyve/acpi.h
++++ b/usr.sbin/bhyve/acpi.h
+@@ -64,5 +64,9 @@
+ void	dsdt_indent(int levels);
+ void	dsdt_unindent(int levels);
+ void	sci_init(struct vmctx *ctx);
++#ifdef BHYVE_SNAPSHOT
++struct vm_snapshot_meta;
++int	pm_snapshot(struct vm_snapshot_meta *meta);
++#endif
+ 
+ #endif /* _ACPI_H_ */
+--- a/usr.sbin/bhyve/vmgenc.c
++++ b/usr.sbin/bhyve/vmgenc.c
+@@ -49,6 +49,7 @@
+ #include "vmgenc.h"
+ 
+ static uint64_t	vmgen_gpa;
++static char	*vmgen_region;
+ 
+ void
+ vmgenc_init(struct vmctx *ctx)
+@@ -60,6 +61,7 @@
+ 	    &vmgen_gpa);
+ 	if (error != 0)
+ 		errx(4, "%s: bootrom_alloc", __func__);
++	vmgen_region = region;
+ 
+ 	/*
+ 	 * It is basically harmless to always generate a random ID when
+@@ -75,6 +77,33 @@
+ #endif
+ }
+ 
++#ifdef BHYVE_SNAPSHOT
++/*
++ * Called once a snapshot has been restored (devices, ACPI PM state and
++ * kernel state, including the interrupt controllers), before any vCPU runs.
++ * The generation ID page is not part of the snapshot, so it already holds
++ * the fresh ID vmgenc_init() wrote; write another one anyway so that the
++ * change does not depend on that, and raise the GPE so that the guest's
++ * _E00 handler notifies \_SB.GENC (0x80): the guest re-reads the ID and
++ * reseeds (FreeBSD vmgenc(4): random_harvest_direct into Fortuna pool 0;
++ * Linux vmgenid: add_vmfork_randomness).  A live checkpoint never calls
++ * this, so the running VM keeps its ID.
++ */
++void
++vmgenc_restore(struct vmctx *ctx)
++{
++	if (vmgen_region == NULL)
++		return;
++	if (getentropy(vmgen_region, sizeof(struct uuid)) == -1)
++		err(4, "%s: getentropy", __func__);
++#ifdef __amd64__
++	acpi_raise_gpe(ctx, GPE_VMGENC);
++#else
++	(void)ctx;
++#endif
++}
++#endif
++
+ void
+ vmgenc_write_dsdt(void)
+ {
+--- a/usr.sbin/bhyve/vmgenc.h
++++ b/usr.sbin/bhyve/vmgenc.h
+@@ -27,3 +27,6 @@
+ #pragma once
+ void	vmgenc_init(struct vmctx *);
+ void	vmgenc_write_dsdt(void);
++#ifdef BHYVE_SNAPSHOT
++void	vmgenc_restore(struct vmctx *);
++#endif
+--- a/usr.sbin/bhyve/snapshot.c
++++ b/usr.sbin/bhyve/snapshot.c
+@@ -884,6 +884,18 @@
+ 
+ #ifdef __amd64__
+ 	ret = vm_restore_device(rstate, atkbdc_snapshot, "atkbdc", NULL);
++	if (ret == 0) {
++		size_t pm_size;
++
++		/* Snapshots from a bhyve without pm_snapshot have no "pm". */
++		if (lookup_dev("pm", JSON_DEV_ARR_KEY, rstate,
++		    &pm_size) != NULL)
++			ret = vm_restore_device(rstate, pm_snapshot, "pm",
++			    NULL);
++		else
++			EPRINTLN("snapshot has no ACPI PM state; "
++			    "PM1/GPE0 enables not restored");
++	}
+ #else
+ 	ret = 0;
+ #endif
+@@ -1129,6 +1141,9 @@
+ #ifdef __amd64__
+ 	ret = vm_snapshot_device(atkbdc_snapshot, "atkbdc", NULL,
+ 	    data_fd, xop, meta, &offset);
++	if (ret == 0)
++		ret = vm_snapshot_device(pm_snapshot, "pm", NULL,
++		    data_fd, xop, meta, &offset);
+ #else
+ 	ret = 0;
+ #endif
+--- a/usr.sbin/bhyve/bhyverun.c
++++ b/usr.sbin/bhyve/bhyverun.c
+@@ -994,6 +994,10 @@
+ 			EPRINTLN("Failed to resume PCI device state.");
+ 			exit(1);
+ 		}
++
++		/* New VM generation: tell the guest (vCPUs not running yet). */
++		if (get_config_bool("acpi_tables"))
++			vmgenc_restore(ctx);
+ 	}
+ #endif
+ 
