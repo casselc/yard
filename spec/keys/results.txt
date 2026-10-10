@@ -1,0 +1,108 @@
+quint 0.32.0, seed 0x5eed, steps 80, samples 1200 (design) / 1500 (design, stepSpill) / 1000 (mutants)
+sim   design                     step       safety                1200 x 80  ok       (expect ok      )  305.8s
+wit   design step: wResumed was witnessed in 33 trace(s) out of 1200 explored (2.75%)
+wit   design step: wResumedTwice was witnessed in 0 trace(s) out of 1200 explored (0.00%)
+wit   design step: wUnloaded was witnessed in 1194 trace(s) out of 1200 explored (99.50%)
+wit   design step: wReloaded was witnessed in 9 trace(s) out of 1200 explored (0.75%)
+wit   design step: wSpillShredded was witnessed in 971 trace(s) out of 1200 explored (80.92%)
+wit   design step: wShredByRevoke was witnessed in 613 trace(s) out of 1200 explored (51.08%)
+wit   design step: wProjectShredded was witnessed in 1180 trace(s) out of 1200 explored (98.33%)
+wit   design step: wRekeyed was witnessed in 622 trace(s) out of 1200 explored (51.83%)
+wit   design step: wStaleRefused was witnessed in 0 trace(s) out of 1200 explored (0.00%)
+wit   design step: wResumeAfterHaloRestart was witnessed in 13 trace(s) out of 1200 explored (1.08%)
+wit   design step: wResumeAfterReboot was witnessed in 7 trace(s) out of 1200 explored (0.58%)
+wit   design step: wResealed was witnessed in 90 trace(s) out of 1200 explored (7.50%)
+wit   design step: wReopened was witnessed in 21 trace(s) out of 1200 explored (1.75%)
+wit   design step: wPrefilled was witnessed in 5 trace(s) out of 1200 explored (0.42%)
+wit   design step: wRevokeFenced was witnessed in 0 trace(s) out of 1200 explored (0.00%)
+sim   design                     stepSpill  safety                1500 x 80  ok       (expect ok      )  144.9s
+wit   design stepSpill: wResumed was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wResumedTwice was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wUnloaded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wReloaded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wSpillShredded was witnessed in 761 trace(s) out of 1500 explored (50.73%)
+wit   design stepSpill: wShredByRevoke was witnessed in 686 trace(s) out of 1500 explored (45.73%)
+wit   design stepSpill: wProjectShredded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wRekeyed was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wStaleRefused was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wResumeAfterHaloRestart was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wResumeAfterReboot was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wResealed was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wReopened was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wPrefilled was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   design stepSpill: wRevokeFenced was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+sim   designTcp                  stepSpill  safety                1500 x 80  ok       (expect ok      )  144.0s
+wit   designTcp stepSpill: wResumed was witnessed in 1 trace(s) out of 1500 explored (0.07%)
+wit   designTcp stepSpill: wResumedTwice was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wUnloaded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wReloaded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wSpillShredded was witnessed in 740 trace(s) out of 1500 explored (49.33%)
+wit   designTcp stepSpill: wShredByRevoke was witnessed in 684 trace(s) out of 1500 explored (45.60%)
+wit   designTcp stepSpill: wProjectShredded was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wRekeyed was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wStaleRefused was witnessed in 3 trace(s) out of 1500 explored (0.20%)
+wit   designTcp stepSpill: wResumeAfterHaloRestart was witnessed in 1 trace(s) out of 1500 explored (0.07%)
+wit   designTcp stepSpill: wResumeAfterReboot was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wResealed was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wReopened was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wPrefilled was witnessed in 0 trace(s) out of 1500 explored (0.00%)
+wit   designTcp stepSpill: wRevokeFenced was witnessed in 3 trace(s) out of 1500 explored (0.20%)
+sim   design                     stepReplay safety                1000 x 80  ok       (expect ok      )    2.2s
+wit   design stepReplay: wResumed was witnessed in 140 trace(s) out of 1000 explored (14.00%)
+wit   design stepReplay: wResumedTwice was witnessed in 131 trace(s) out of 1000 explored (13.10%)
+wit   design stepReplay: wUnloaded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wReloaded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wSpillShredded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wShredByRevoke was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wProjectShredded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wRekeyed was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wStaleRefused was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wResumeAfterHaloRestart was witnessed in 138 trace(s) out of 1000 explored (13.80%)
+wit   design stepReplay: wResumeAfterReboot was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wResealed was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wReopened was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wPrefilled was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   design stepReplay: wRevokeFenced was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+sim   designTcp                  stepReplay safety                1000 x 80  ok       (expect ok      )    2.4s
+wit   designTcp stepReplay: wResumed was witnessed in 500 trace(s) out of 1000 explored (50.00%)
+wit   designTcp stepReplay: wResumedTwice was witnessed in 499 trace(s) out of 1000 explored (49.90%)
+wit   designTcp stepReplay: wUnloaded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wReloaded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wSpillShredded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wShredByRevoke was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wProjectShredded was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wRekeyed was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wStaleRefused was witnessed in 41 trace(s) out of 1000 explored (4.10%)
+wit   designTcp stepReplay: wResumeAfterHaloRestart was witnessed in 411 trace(s) out of 1000 explored (41.10%)
+wit   designTcp stepReplay: wResumeAfterReboot was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wResealed was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wReopened was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wPrefilled was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+wit   designTcp stepReplay: wRevokeFenced was witnessed in 0 trace(s) out of 1000 explored (0.00%)
+sim   unloadUnderActive          step       keyUnderRunning       1000 x 80  VIOLATED (expect VIOLATED)    3.1s
+sim   loadDuringUnload           step       keyUnderRunning       1000 x 80  VIOLATED (expect VIOLATED)  164.0s
+sim   trustConsumerAfterRestart  step       keyUnderRunning       1000 x 80  VIOLATED (expect VIOLATED)   44.4s
+sim   blindRegisterRetry         step       keysAccounted         1000 x 80  VIOLATED (expect VIOLATED)    2.6s
+sim   rekeyDropsOld              step       projectKeyAvailable   1000 x 80  VIOLATED (expect VIOLATED)    1.8s
+sim   shredBeforeLoadSettles     stepSpill  noDecryptAfterShred   1000 x 80  VIOLATED (expect VIOLATED)    1.9s
+sim   revokeOnlyByMessage        stepSpill  noDecryptAfterShred   1000 x 80  VIOLATED (expect VIOLATED)    2.0s
+sim   revokeOnlyByMessageExpZero stepSpill  noDecryptAfterShred   1000 x 80  ok       (expect ok      )  173.3s
+sim   staleEpochAccepted         stepReplay noStaleEpoch          1000 x 80  VIOLATED (expect VIOLATED)    3.5s
+sim   haloForgetsEpochs          stepReplay noStaleEpoch          1000 x 80  VIOLATED (expect VIOLATED)    3.7s
+sim   identityAsWritten          stepReplay noStaleEpoch          1000 x 80  VIOLATED (expect VIOLATED)    3.8s
+sim   staleEpochAcceptedSocket   stepReplay noStaleEpoch          1000 x 80  ok       (expect ok      )    4.0s
+sim   haloForgetsEpochsSocket    stepReplay noStaleEpoch          1000 x 80  ok       (expect ok      )    4.0s
+sim   identityAsWrittenSocket    stepReplay noStaleEpoch          1000 x 80  ok       (expect ok      )    4.1s
+runs  runsDesign                       ^(?!.*Breaks)(?!socket).*Test$     passed 16 failed 0 (expect all-pass)
+runs  runsDesignSocket                 ^socket.*Test$                     passed 1 failed 0 (expect all-pass)
+runs  runsShredBeforeLoadSettles       ^shredBeforeLoadSettlesBreaksTest$ passed 1 failed 0 (expect all-pass)
+runs  runsRevokeOnlyByMessage          ^revokeOnlyByMessageBreaksTest$    passed 1 failed 0 (expect all-pass)
+runs  runsStaleEpochAccepted           ^staleEpochAcceptedBreaksTest$     passed 1 failed 0 (expect all-pass)
+runs  runsHaloForgetsEpochs            ^haloForgetsEpochsBreaksTest$      passed 1 failed 0 (expect all-pass)
+runs  runsIdentityAsWritten            ^identityAsWrittenBreaksTest$      passed 1 failed 0 (expect all-pass)
+runs  runsUnloadUnderActive            ^unloadUnderActiveBreaksTest$      passed 1 failed 0 (expect all-pass)
+runs  runsLoadDuringUnload             ^loadDuringUnloadBreaksTest$       passed 1 failed 0 (expect all-pass)
+runs  runsTrustConsumerAfterRestart    ^trustConsumerAfterRestartBreaksTest$ passed 1 failed 0 (expect all-pass)
+runs  runsBlindRegisterRetry           ^blindRegisterRetryBreaksTest$     passed 1 failed 0 (expect all-pass)
+runs  runsRekeyDropsOld                ^rekeyDropsOldBreaksTest$          passed 1 failed 0 (expect all-pass)
+failures: 0

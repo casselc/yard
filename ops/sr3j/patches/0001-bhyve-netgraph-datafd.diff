@@ -1,0 +1,70 @@
+--- a/usr.sbin/bhyve/net_backend_netgraph.c	2026-10-07 09:29:52.416509452 -0700
++++ b/usr.sbin/bhyve/net_backend_netgraph.c	2026-10-07 09:30:44.502970639 -0700
+@@ -35,7 +35,11 @@
+ #include <capsicum_helpers.h>
+ #endif
+ #include <err.h>
++#include <errno.h>
++#include <limits.h>
+ #include <netgraph.h>
++#include <netgraph/ng_socket.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sysexits.h>
+ #include <unistd.h>
+@@ -70,6 +74,47 @@
+ 
+ 	be->fd = -1;
+ 
++	/*
++	 * datafd=N: use an inherited ng_socket(4) data socket that a privileged
++	 * parent already connected to the destination hook.  Creating or
++	 * connecting netgraph nodes needs PRIV_NETGRAPH_CONTROL; reading and
++	 * writing an existing data socket does not, so with this option bhyve
++	 * can run unprivileged (e.g. as a dedicated uid inside a jail).
++	 */
++	value = get_config_value_node(nvl, "datafd");
++	if (value != NULL) {
++		char *end;
++		long v;
++		int opt;
++		socklen_t optlen;
++
++		errno = 0;
++		v = strtol(value, &end, 10);
++		if (errno != 0 || *end != '\0' || v < 3 || v > INT_MAX) {
++			EPRINTLN("netgraph: invalid datafd '%s'", value);
++			return (-1);
++		}
++		optlen = sizeof(opt);
++		if (getsockopt((int)v, SOL_SOCKET, SO_DOMAIN, &opt, &optlen) != 0 ||
++		    opt != PF_NETGRAPH) {
++			EPRINTLN("netgraph: datafd %ld is not a netgraph socket", v);
++			return (-1);
++		}
++		optlen = sizeof(opt);
++		if (getsockopt((int)v, SOL_SOCKET, SO_PROTOCOL, &opt, &optlen) != 0 ||
++		    opt != NG_DATA) {
++			EPRINTLN("netgraph: datafd %ld is not a data socket", v);
++			return (-1);
++		}
++		if (get_config_value_node(nvl, "path") != NULL ||
++		    get_config_value_node(nvl, "socket") != NULL) {
++			EPRINTLN("netgraph: datafd excludes path/peerhook/socket");
++			return (-1);
++		}
++		be->fd = (int)v;
++		goto connected;
++	}
++
+ 	memset(&ngc, 0, sizeof(ngc));
+ 
+ 	value = get_config_value_node(nvl, "path");
+@@ -108,6 +153,7 @@
+ 
+ 	close(ctrl_sock);
+ 
++connected:
+ 	flags = fcntl(be->fd, F_GETFL);
+ 
+ 	if (flags < 0) {

@@ -1,0 +1,697 @@
+# SR0: the session suspend/resume lifecycle
+
+The Quint model of yard-ctl's session lifecycle (HARNESS.md, "Milestones:
+suspend and resume", SR0), and how `internal/lifecycle` is driven by it.
+
+| File | What it is |
+|---|---|
+| `lifecycle.qnt` | the model; instances `design`, `design2`, `designPause` (SR1) and 14 mutants |
+| `lifecycle_test.qnt` | scripted runs: design paths, each mutant's counterexample (`*BreaksTest`) and the step the design blocks (`*DesignTest`) |
+| `run_models.sh` | runs every instance with `quint run` at a fixed seed, then every scripted run |
+| `gen_traces.sh` | writes the ITF traces the Go replay test uses (`internal/lifecycle/testdata/traces`) |
+
+Quint 0.32: `quint typecheck`, `quint run`, `quint test`. Nothing here uses
+`quint verify`: every result below is sampled, not exhaustive.
+
+## Scope
+
+**Modelled.** Sessions (one in `design`, two in `design2`: a service and
+a keep-warm KV session) through the states active, idle, suspending,
+suspended, resuming, expired, failed. The sessions row (SQLite) is the
+durable record: kind, generation, phase, current instance, current
+checkpoint, the op the phase waits on, the one-shot resume token, the
+credential epoch, the decision time and activity sequence, the inbox of
+held messages. Seven kinds of external call, each an *op*, are modelled as
+request, effect and answer (next section). Also modelled:
+- an abstract clock (`Tick`), op timeouts, idle detection, and TTL;
+- a slow activity observation;
+- tool-call workspace writes in flight;
+- the broker's credentials;
+- a yard-ctl crash and restart at any step;
+- instance crashes;
+- concurrent resume triggers (`msg`, `timer`).
+
+**Assumptions** (each an environment rule in the model):
+- **A1. The settle bound is observable.** Every op runs as a process (VMM,
+  bhyvectl, jail teardown, engine spill, STS call, rm). yard-ctl can tell
+  whether a process for an op still runs, including one started by an
+  earlier incarnation (pidfile, jail name, VMM API socket).
+  `Backend.InFlight` is that observation. The model's `settled(id)`: no
+  copy of the op is in flight.
+- **A2. Effects are observable after settle.** Each observation reads the
+  effect itself:
+  - the instance's state by name (`jls`, VMM state);
+  - the artifact's digest and size against the record;
+  - the broker's credential list;
+  - the artifact directory.
+- **A3. One yard-ctl process owns the database.** Op ids come from its
+  counter. The conditional UPDATEs (consume, expire) and the compare-and-swap
+  commits defend against concurrent handlers and against a second handle
+  (a CLI, a stray process); they do not make two yard-ctl processes safe
+  to run.
+- **A4. Answers reach only their sender.** An answer to a copy sent by an
+  earlier incarnation is lost; that op is `Unknown` after restart.
+- **A5. Each external call is one op row**, inserted in the same
+  transaction as the row change that needs it.
+  - A crash between commit and send leaves a Pending op with no copy.
+  - Recovery makes that op Unknown. It is already settled, so the next
+    step observes it NotDone and retries it.
+- **A6. The workspace dataset survives suspend.** Restore makes the
+  workspace the checkpoint's ZFS snapshot (clone-and-switch), because VM
+  memory and disk must match.
+
+**Not modelled.**
+- **Message delivery to the harness** (`Deliver`) is atomic. The payload
+  queue belongs to the broker and SR5. This row is open in the register.
+- **Instance loss outside suspend/resume.** An Active session whose
+  instance dies stays Active. That is a liveness gap for SR1/SR2 health
+  checks, not part of SR0.
+- **Key management and dataset encryption.** `enc` is an attribute of
+  artifacts; the Machine refuses to start on an unencrypted dataset.
+- **Live process state.** SR1 recreates services from their spec.
+- **Byzantine backends.**
+- **Liveness.** Quint runs check safety on finite runs. Each liveness
+  hazard is checked as the state property that is its mechanism (I4, I5,
+  I7), plus a scripted run.
+
+**Bounds** (state space only): `MAX_GEN` 2 suspends per session, 16 ops,
+4 tokens, 2 attempts per retry, 3 environment faults per trace (lost or
+answer-lost copies, partial writes, instance or yard-ctl crashes), 1
+message, 3 activities, clock to 24.
+
+## The model in one picture
+
+```
+Active --GoIdle--> Idle --SuspendBegin--> Suspending
+                                          PQuiesce --(quiesce Done)--> PCheckpoint --(ckpt Done)--> PDestroy
+                                             |  any phase, step resolved: SuspendAbort -> PAbort    |
+                                             v                                                     | destroy Done,
+                         Idle <--SuspendAbortDone-- PAbort --SuspendFail--> Failed                  | activity re-read
+                                                                                                    v
+Active <--ResumeComplete-- Resuming(PMint) <--ResumeMint-- Resuming(PRestore) <--ResumeConsume-- Suspended --Expire--> Expired
+                                        ResumeAbort (restore NotDone) -> Suspended; ResumeFail -> Failed
+```
+
+Every op: `newOp` (row Pending plus a copy) -> `OpLand` / `OpLandAnswerLost`
+/ `OpLandPartial` / `OpLose` (environment) -> the answer (`Done` only for a
+success exit to the sender) or `OpTimeout` (`Unknown`) -> `OpResolve` once
+settled (Done/NotDone by observation) -> `OpRetry` (retryable kinds only).
+`CtlCrash` drops drivers and observations. `CtlRestart` starts a new
+incarnation. `RecoverOps` marks the old incarnation's Pending ops Unknown,
+and `Adopt` gives a suspending or resuming row a recovery driver, which
+continues through the same actions.
+
+## Invariants
+
+| # | Invariant | Quint |
+|---|---|---|
+| I1 | A snapshot is resumed at most once: each token claimed once, each checkpoint started once, at most one live instance per session | `resumedAtMostOnce` = `tokenClaimedOnce`, `restoredOnce`, `oneInstance` |
+| I2 | No acknowledged workspace write is lost across suspend (a suspended session's snapshot holds every acked write; otherwise the live workspace does) | `noAckedWriteLost` |
+| I3 | A resumed session holds no credential the broker honours that was requested before it suspended | `noPreSuspendCredential` |
+| I4 | Artifacts are only on encrypted storage, and each belongs to the current suspend record or has a delete owed (an op row not yet done): so after resume or TTL they are gone or being deleted | `artifactsAccounted` |
+| I5 | A resume holding the token finds its artifact until the restore is done | `resumeKeepsArtifacts` |
+| I6 | A session is suspended only after IDLE_TIMEOUT with no activity | `suspendedOnlyIdle` |
+| I7 | TTL expiry never drops a held message | `noMessageLost` |
+| I8 | (SR1) An awake session (Active, Idle) has no frozen (SIGSTOPped) instance: no message goes to a stopped harness, and no SIGSTOP lands after the SIGCONT | `noFrozenAwake` |
+| I9 | (SR1 decision 2, 2026-10-07) No instance is restored, without the explicit override, on a workspace changed since its suspend snapshot | `noSilentDrift` |
+| I10 | (SR1 decision 3) A failed session has no live instance: an awake session is declared lost only on a definite "not alive" for its current instance and generation | `noLiveFailed` |
+| I11 | (SR1 layout D) A running instance's project key is loaded and its clone mounted: no key is unloaded (or clone unmounted) under a live session, and nothing is restored without its key | `keyUnderActive` |
+
+## Register of external calls
+
+Format of casselc/observability otel-chdb AMBIGUITY.md, "Rules":
+- every unknown outcome has a settle bound, a resolving observation and a
+  caller rule (wait, verify, fence or idempotent retry);
+- the unsafe rule is a named mutant (casselc/observability
+  otel-chdb/model/TEMPLATE.md).
+
+"Atomic" marks a call the model does in one step.
+
+| # | Call | Outcomes: done / not done / unknown | Settle bound | Resolving observation | Caller rule | Quint actions | Mutant (breaks) |
+|---|---|---|---|---|---|---|---|
+| X1 | **Quiesce**: SR1 `jail_remove` and wait for every process to exit (closing a jail descriptor does not kill, and a dying jail takes time); SR2 FC pause; SR3 bhyve pause; SR4 engine freeze | **done:** exit 0. **unknown:** timeout, error, restart | the teardown/pause process exits (A1) | instance by name is not running | **wait** for done (observed) before the checkpoint: the fence against late workspace writes; **idempotent retry** if not done | `SuspendBegin` (send), `OpLand*`, `OpLose`, `OpTimeout`, `OpResolve`, `OpRetry`; effect `OQuiesce` drops in-flight writes | `snapshotBeforeQuiesce` (I2) |
+| X2 | **Checkpoint**: ZFS snapshot plus `bhyvectl --suspend`, FC snapshot, or engine KV spill; create-only artifact path named by the op id | **done:** exit 0 and the artifact verifies. **not done:** after settle, the artifact is missing or partial. **unknown:** timeout (may still complete), error after writing, killed mid-write (partial), restart | the VMM/engine process exits or the op's own completion (A1) | artifact digest and size against the suspend record (`CheckpointOK`) | **wait** to settle, then **verify**. Not done: delete it (owed) and take a new checkpoint under a new id. Never retried blindly | `SuspendCheckpoint`, `SuspendCheckpointRetry`, `OpLandPartial`, `OpTimeout`, `OpResolve` | `checkpointTimeoutNotDone` (I4); `recoverAssumesNotDone` (I4) |
+| X3 | **Destroy** the original instance after the checkpoint (frees RAM) | done: exit 0. unknown: timeout, error | process exits | instance by name is gone | **wait** for done before commit. A paused original that lingers beside a restored copy is two instances | `SuspendDestroy`, `OpRetry` | `commitBeforeDestroy` (I1) |
+| X4 | **Unquiesce** (abort path) | done: exit 0. unknown | process exits | instance running | idempotent retry. If observed not done and the instance is gone, the session fails | `SuspendAbort`, `SuspendAbortDone`, `SuspendFail` | — (liveness only) |
+| X5 | **Restore**: FC load, `bhyve -r`, service start from its spec, KV restore; instance name (session, gen) is create-only | **done:** exit 0, or the name exists. **not done:** after settle, no instance by that name. **unknown:** error with the VM started (lost answer), a late start, restart | the restore process exits (A1) | instance (session, gen) exists | **fence** (create-only name) and **verify**. Only a restore observed not done goes back to Suspended with a fresh token. A restart never assumes not done | `ResumeConsume` (send), `ResumeMint`, `ResumeAbort`, `ResumeFail`, `OpTimeout`, `OpResolve`, `RecoverOps`, `Adopt` | `blindRestoreRetry` (I1) |
+| X6 | **STS mint** of a session credential (broker refresh, and the re-mint at resume) | done: the broker holds a credential of the epoch. unknown: timeout, error, late answer | the STS call returns | the broker's credential list holds the epoch | **fence**: the epoch is bumped at commit. The STS mints only the row's epoch and the broker honours only it, so a mint requested before the suspend that answers after the resume is refused or dead. **Idempotent retry** for the current epoch | `CredRefresh`, `ResumeMint`, `ResumeComplete`, `OpRetry` | `noCredEpoch` (I3) |
+| X7 | **Artifact delete** (after resume, abort, failure, and at TTL) by checkpoint id | done: exit 0 and gone. unknown: lost, late | the rm process exits | the artifact is absent | **idempotent retry** until observed. The delete is an op row inserted with the row change that owes it (A5). Paths are per checkpoint, so a late delete cannot hit a newer suspend | `issueDelete` in `SuspendCheckpointRetry`, `SuspendAbort`, `ResumeComplete`, `ResumeFail`, `Expire`; `OpRetry` | `fireAndForgetDelete` (I4); `gcByAge` (I5, the gcReopens shape: GC by age while a resume holds the token) |
+| X8 | **Activity observation** (the broker's count of model and tool calls) | an observation, never "not done": slow, answered later | none: freshness is the answer time | the sequence number, dated **at the answer** when it changed | **verify after the fence**: the commit re-reads activity requested after the quiesce was known done, and requires the sequence unchanged and no held messages, else abort | `ObsReq`, `ObsAnswer`, `GoIdle`, `SuspendBegin`, `SuspendCommit`, `SuspendAbort` | `observeAtRequest` (I6); `ignoreActivityDuringSuspend` (I6) |
+| X9 | **Workspace write** by a tool call (not yard-ctl's call, but the late effect quiesce fences) | acked when it lands; may land with the ack lost; dies with the quiesce | the quiesce | — | fenced by X1 | `WriteIssue`, `WriteLand`, `WriteLandAckLost` | `snapshotBeforeQuiesce` (I2) |
+| X10 | **Token consume**: local SQLite, one conditional `UPDATE sessions SET state='Resuming' … WHERE id=? AND state='Suspended' AND token=?` plus the restore op row in one transaction | done: one row changed. not done: none (`ResumeReject`) | the transaction | — | atomic (local) | `ResumeConsume`, `ResumeReject` | `nonAtomicConsume` (I1) |
+| X11 | **Expire**: local conditional `UPDATE … WHERE state='Suspended' AND token=? AND inbox=0` plus the owed delete; races X10, one wins | as X10 | the transaction | — | atomic (local) | `Expire` | `expireDropsInbox` (I7) |
+| X12 | **Message delivery** to the harness | — | — | — | **atomic in the model (open)** | `Deliver` | — |
+| X13 | **Pause** (SR1 pause tier): SIGSTOP every process of the instance, from inside its jail | done: exit 0, every process stopped (re-listed: one forked during the signal round is stopped too). unknown: timeout, error, restart | the signalling process exits (op lock) | every process of the instance is in state T (`Frozen`) | **idempotent retry while the row waits on it**; **fence**: the unpause is sent only once the pause is resolved | `PauseBegin`, `PauseDone`, `OpRetry` | `unpauseBeforePauseSettles` (I8) |
+| X14 | **Unpause**: SIGCONT until no process is stopped | done: exit 0, none stopped. not done: the instance is gone (fail) | as X13 | instance exists, no process stopped | idempotent retry | `UnpauseBegin`, `UnpauseDone`, `UnpauseFail` | — |
+| X15 | **Any retry of a stop/start/pause op** (X1, X3, X4, X13, X14) | — | — | — | **retry only while the row still waits on that op** (`RETRY_CURRENT`); a delete (X7) and a mint (X6) are owed whatever the row does | `OpRetry` | `retrySupersededOp` (I8) |
+| X16 | **Load key only** (SR1 layout D, resume phase `PKey`): `zfs load-key ws/<project>` with the raw key on stdin (unwrapped from yard-ctl's SQLite); no writable clone mount | **done:** exit 0 or the key already available. **unknown:** timeout, error, restart. **not done:** after settle, keystatus unavailable | the zfs process exits (op flock) | `keystatus` = available; mounting belongs to Restore | **fence**: sent only once the project's unload (X17, X18) is resolved (`KEY_FENCE`); **idempotent retry** while the row waits on it; not done → resume abort, fresh token | `ResumeConsume` (to `PKey`), `ResumeLoadKey`, `ResumeKeyDone`, `ResumeAbort`, `OpRetry` | `loadDuringUnload`, `resumeWithoutKey` (I11) |
+| X17 | **Unmount** every dataset of a project (never `-f`) | done: exit 0, none mounted. unknown: timeout, error (EBUSY is not done), restart | zfs exits | no dataset of the project mounted | **guard**: only when every session of the project is Suspended, Expired or Failed with no driver and no load unresolved (`KEY_GUARD`); idempotent retry while the project waits on it; give up (key stays loaded) when not done | `KeyUnloadBegin`, `KeyUnmountDone`, `KeyUnloadAbort`, `RecoverProjOps`, `OpRetry` | `unloadUnderActive` (I11) |
+| X18 | **Unload key**: `zfs unload-key ws/<project>` (ZFS refuses while anything is mounted) | done: exit 0, keystatus unavailable. unknown | zfs exits | keystatus = unavailable | after X17 done; idempotent retry | `KeyUnmountDone`, `KeyUnloadDone`, `KeyUnloadAbort` | (I11) |
+| X19 | **Drift check** inside Restore (decision 2): `zpool sync`, then `zfs get written@<suspend snapshot>` BEFORE writable-mounting the clone; after acceptance mount, validate and start/readiness under one op lock | **refused** (definite, no new mount/instance): written > 0 without the override. An unreadable value is an error (unknown), never a refusal or a go | inside X5; effectful mount/start children inherit the op lock | — (a lost refusal resolves as X5 not done) | **refuse** unless explicitly overridden (`ResumeConsumeForce`, `yard-svc resume -force`); record `Drift`/`resume_refused_drift`, suppress automatic held-message retry. Trusted host writers must not race the observation-to-mount interval | `WorkspaceEdit`, partial service restore writes, `OpLand` (Refused), `ResumeAbort`, `ResumeConsumeForce` | `resumeIgnoresDrift` (I9); backend/runtime order tests |
+| X20 | **Liveness probe** while awake (decision 3; SR0 open decision 4): does instance `inst` exist with processes | an observation: alive, not alive, or no answer | the probe's own timeout (`OP_TIMEOUT`); a late answer to an earlier request is dropped | jail by name and its processes (`Instance`) | **dead only on a definite answer for the row's current instance and generation** (`PROBE_CURRENT`: a suspend attempt bumps the generation); a timeout is unknown, never dead (`PROBE_TIMEOUT_UNKNOWN`); then `LostDetect`: Failed, fact `lost` | `ProbeReq`, `ProbeExec`, `ProbeAnswer` (environment), `ProbeTimeout`, `LostDetect` | `staleProbe`, `deadOnProbeTimeout` (I10) |
+
+Every op row has a metric source: Fact records (below) carry the outcome,
+and the op table holds Unknown/NotDone counts per kind. A production
+counter per unknown class is open (rule 5).
+
+## Design rules and mutants: results
+
+Every run uses `quint run lifecycle.qnt --main <instance> --invariant
+<inv> --max-steps 100 --max-samples 3000 --seed 0x5eed`, then scripted
+`quint test` (`sh run_models.sh`). Run on 2026-10-07 with the committed
+model. These are sampled runs, not proofs.
+
+| Instance | Invariant | Expected | `quint run` (seed 0x5eed) | Scripted `*BreaksTest` |
+|---|---|---|---|---|
+| `design` | all (I1–I7) | holds | holds (~2930 traces) | — |
+| `design2 (2 sessions, one keep-warm)` | all | holds | holds (~2920) | — |
+| `nonAtomicConsume` | I1 | breaks | **breaks** (~850 traces to the first) | breaks |
+| `blindRestoreRetry` | I1 | breaks | held at 3000 and 20000 | **breaks** |
+| `commitBeforeDestroy` | I1 | breaks | **breaks** (~870) | breaks |
+| `snapshotBeforeQuiesce` | I2 | breaks | held at 3000 and 20000 | **breaks** |
+| `noCredEpoch` | I3 | breaks | held at 3000 and 20000 | **breaks** |
+| `checkpointTimeoutNotDone` | I4 | breaks | **breaks** (~650) | breaks |
+| `fireAndForgetDelete` | I4 | breaks | **breaks** (~40) | breaks |
+| `recoverAssumesNotDone` | I4 | breaks | held at 3000 and 20000 | **breaks** |
+| `gcByAge` | I5 | breaks | **breaks** (~520) | breaks |
+| `observeAtRequest` | I6 | breaks | **breaks** (~180) | breaks |
+| `ignoreActivityDuringSuspend` | I6 | breaks | **breaks** (~390) | breaks |
+| `expireDropsInbox` | I7 | breaks | held at 3000 and 20000 | **breaks** |
+
+**Focused instances** (`<m>Focus` / `<m>FocusDesign`, same environment and step; `--step` as listed; 3000 samples x 100 steps, seed 0x5eed). Each step is a restriction of `step`, so every focused trace is a trace of the full model:
+- `stepQuiet`: Tick, OpLand, ObsAnswer and the controller;
+- `stepWrites`: `stepQuiet` plus tool-call writes;
+- `stepCrash`: `stepQuiet` plus yard-ctl crash and restart;
+- `stepInbox`: `stepQuiet` plus messages arriving only while suspended.
+
+The environment is narrowed with no faults, no activity, and 1 tick timeouts / a 100-tick credential TTL / a 1-tick TTL where listed.
+
+| Mutant | Step, environment | Mutant (traces to the first counterexample) | Design under the same instance |
+|---|---|---|---|
+| `blindRestoreRetry` | `stepQuiet`, OP_TIMEOUT 1 | **breaks** I1 (~32) | holds (~3000) |
+| `snapshotBeforeQuiesce` | `stepWrites`, 4 writes | **breaks** I2 (~240) | holds (~3000) |
+| `noCredEpoch` | `stepQuiet`, CRED_TTL 100 | **breaks** I3 (~13) | holds (~2900) |
+| `recoverAssumesNotDone` | `stepCrash`, 1 crash | **breaks** I4 (~570) | holds (~3100) |
+| `expireDropsInbox` | `stepInbox`, maxAge 1, 2 messages | **breaks** I7 (~30) | holds (~2900) |
+
+So all 12 mutants now break in random simulation (7 under `step`, 5 under a focused step).
+
+Scripted: `lifecycle_test` 11/11 design paths, `designScripts` 23/23 (12 DesignTests, 11 PrefixTests), each mutant's BreaksTest 1/1. 0 rows off expectation.
+
+Where random simulation "held", it did not reach the counterexample at
+3000 samples x 100 steps, nor at 20000 samples x 120 steps (seed 0x5eed):
+each needs a narrow interleaving (a write between two specific landings, a
+resume inside the credential TTL, a message during the suspended window, a
+crash with a checkpoint in flight). The `*BreaksTest` replays it, and the matching `*DesignTest`
+shows the design disables the step the counterexample needs (with a
+`*PrefixTest` showing that the prefix itself runs on the design, so the
+`.fail()` is not vacuous).
+
+### Design witnesses
+
+`quint run --main design --invariant allInvariants --witnesses … --max-steps 100 --max-samples 3000 --seed 0x5eed`:
+
+| Witness | Traces (of 3000) |
+|---|---|
+| `wIdle` | 1044 (34.8%) |
+| `wSuspending` | 985 (32.8%) |
+| `wSuspended` | 24 (0.8%) |
+| `wResuming` | 21 (0.7%) |
+| `wActive` (after a resume) | 16 (0.53%) |
+| `wResumedWithWrites` | 11 (0.37%) |
+| `wExpired` / `wExpiredClean` (artifacts gone) | 2 / 2 (0.07%) |
+| `wFailed` | 788 (26.3%) |
+| `wRaceRejected` (a second trigger rejected while resuming) | 21 (0.7%) |
+| `wAbortedToIdle` | 206 (6.9%) |
+| `wAdoptSuspending` (restart mid-suspend, recovery driver) | 151 (5.0%) |
+| `wRecoveredResume` (resume completed after a restart) | 16 (0.53%) |
+| `wResolvedUnknown` (an unknown op resolved by observation) | 2215 (73.8%) |
+| `wLateLand` (a copy landed after its op went unknown) | 953 (31.8%) |
+| `wPartialRetried` (partial checkpoint deleted and retaken) | 175 (5.8%) |
+| `wResumeAborted` | **0** — reached by `resumeAbortDesignTest` |
+| `wAdoptResuming` (restart mid-resume) | **0** — reached by `crashResumeDesignTest` |
+| `wHeldMessage` (message held while suspended) | **0** — reached by `heldMessageDeliveredDesignTest`, `expireDropsInbox` prefix |
+
+The three 0% witnesses need three or more specific steps in a row deep in
+a trace; each is reached by a scripted design run, and those runs are in
+the replay set.
+
+### The broken variant: `nonAtomicConsume`
+
+The resume token checked by one statement and claimed by another (a
+`SELECT` then an unconditional `UPDATE`), with two triggers (a message and
+a timer) racing. Counterexample (`nonAtomicConsumeBreaksTest`; random
+simulation finds the same shape, see the table):
+
+| Step | Action | State | Token | Drivers | Claims of token 1 |
+|---|---|---|---|---|---|
+| 0–13 | idle, `SuspendBegin`, quiesce/checkpoint/destroy land, activity re-read | Suspending | 0 | idler | – |
+| 14 | `SuspendCommit` | Suspended | 1 | – | – |
+| 15 | `ResumeCheck(msg, 1)`: the token matches | Suspended | 1 | – | – |
+| 16 | `ResumeCheck(timer, 1)`: still matches | Suspended | 1 | – | – |
+| 17 | `ResumeClaim(msg)`: restore op 4 sent | Resuming | 0 | msg | 1 |
+| 18 | `ResumeClaim(timer)`: restore op 5 sent | Resuming | 0 | msg, timer | **2** (`tokenClaimedOnce` fails) |
+
+Two restores of one checkpoint are now in flight. The restore name fence
+(X5) still lets only one instance start. Without that fence
+(`blindRestoreRetry` shape) both copies start, and the two VMs share RNG
+state and identity tokens. The design and the Go store use the single
+conditional UPDATE. `TestStoreConsumeRaceAcrossHandles` races 16 store
+handles plus an expiry on one token: one winner.
+`TestMachineDoubleResumeRace` races 32 Resume calls through the Machine:
+one winner, 31 `ErrTokenRejected`.
+
+### Other counterexamples (scripted, `lifecycle_test.qnt`)
+
+- **snapshotBeforeQuiesce.** The checkpoint is sent while the quiesce is in
+  flight, and the checkpoint lands. A tool-call write then lands and is
+  acked. Commit leaves the write out of the snapshot (I2), so a resume would
+  roll it back.
+- **checkpointTimeoutNotDone.** A checkpoint times out and is taken as not
+  done. The abort deletes it, the session goes Idle, and the late
+  checkpoint then writes its artifact. That artifact is owed by nothing
+  (I4).
+- **recoverAssumesNotDone.** yard-ctl restarts with a checkpoint in flight
+  and takes it as not done. It deletes it and takes another, and the first
+  copy then lands (I4). A restore in flight is protected by the name fence.
+- **commitBeforeDestroy.** The destroy request is lost and commit goes
+  ahead. A resume starts instance 1 beside the paused original (I1,
+  `oneInstance`).
+- **blindRestoreRetry.** The restore times out and is resent at once with
+  no name fence. Both copies start (I1, `restoredOnce`).
+- **noCredEpoch.** A refresh requested before the suspend lands after the
+  resume. With no epoch, the STS mints it and the broker honours it for its
+  TTL (I3). The original credential had already expired by TTL, so this is
+  the late-mint path alone.
+- **gcByAge.** A sweeper deletes the artifact of a session whose resume
+  holds the token (I5).
+- **observeAtRequest.** Activity happens between the observation request
+  and its answer. Dated at the request, the session looks idle one tick
+  early, and it is suspended with activity inside the window (I6).
+- **ignoreActivityDuringSuspend.** Activity happens after the decision,
+  before the quiesce lands, and the commit does not re-read it (I6).
+- **expireDropsInbox.** A message is held for a suspended session, and TTL
+  expiry drops it (I7).
+- **fireAndForgetDelete.** The delete after a resume is lost, and nothing
+  owes it (I4).
+
+## Mapping: Quint action -> Go
+
+`internal/lifecycle`.
+- `Ctl` (types.go, transitions.go) is pure. Each method's guard and update
+  are the action's `can<Name>` and `apply<Name>`.
+- Arguments the model reads from the environment are parameters, filled by
+  `Machine` from the backends and by the replay from the trace:
+  - `settled` and `observedDone` (op resolution);
+  - instance existence or running;
+  - the activity sequence.
+
+| Quint action | Go | Durable write |
+|---|---|---|
+| `Tick` | `Ctl.Tick` / `SetClock` | – |
+| `OpLand` (answer part) | `Ctl.OpAnswer(id, inc, ok, bytes)` from `Machine.runCopy` | ops row |
+| `OpLandAnswerLost`, `OpLandPartial`, `OpLose` | (environment: no yard-ctl action) | – |
+| `OpTimeout` | `Ctl.OpTimeout` (`Machine.pollOps`) | ops row |
+| `OpResolve` | `Ctl.OpResolve(id, settled, observedDone)` (`Executor.Settled`, `Executor.Observe`) | ops row |
+| `OpRetry` | `Ctl.OpRetry` | ops row |
+| `RecoverOps` | `Ctl.RecoverOps` (`Start`) | ops rows |
+| `Adopt` | `Ctl.Adopt` (`Start`) | – (memory) |
+| `CtlCrash` / `CtlRestart` | process death / `Start` (`Ctl.CtlRestart`, incarnation in `meta`) | meta |
+| `ObsReq` / `ObsAnswer` | `Ctl.ObsReq` / `Ctl.ObsAnswer(s, seq)` (`Machine.observe`, `ActivitySource`) | – (memory) |
+| `GoIdle`, `Touch`, `Deliver` | `Ctl.GoIdle`, `Ctl.Touch`, `Ctl.Deliver(s, instUp)` | sessions row |
+| `MessageArrive` | `Ctl.MessageArrive` (`Machine.Message`) | sessions row |
+| `CredRefresh` | `Ctl.CredRefresh` | ops row |
+| `SuspendBegin` | `Ctl.SuspendBegin` | row + quiesce op, one tx |
+| `SuspendCheckpoint` | `Ctl.SuspendCheckpoint` | row + checkpoint op |
+| `SuspendCheckpointRetry` | `Ctl.SuspendCheckpointRetry` | row + delete op + checkpoint op |
+| `SuspendDestroy` | `Ctl.SuspendDestroy` | row + destroy op |
+| `SuspendCommit` | `Ctl.SuspendCommit` (fact `suspend`) | row (CAS) |
+| `SuspendAbort` / `SuspendAbortDone` / `SuspendFail` | `Ctl.SuspendAbort` / `SuspendAbortDone` / `SuspendFail(s, instExists)` | row + delete op + unquiesce op / row / row |
+| `ResumeConsume` / `ResumeReject` | `Ctl.ResumeConsume` -> `ErrTokenRejected`; durable: `Store.ConsumeToken` (the conditional UPDATE) via `Machine.Resume` | row + restore op, one tx |
+| `ResumeMint` / `ResumeComplete` | `Ctl.ResumeMint(s, d, instUp)` / `Ctl.ResumeComplete(s, d, instUp)` (fact `resume`) | row + mint op / row + delete op |
+| `ResumeAbort` / `ResumeFail` | `Ctl.ResumeAbort` / `Ctl.ResumeFail(s, d, instUp)` | row / row + delete op |
+| `Expire` | `Ctl.Expire`; durable: `Store.Expire` (conditional UPDATE racing the consume) | row + delete op, one tx |
+| `ResumeCheck`, `ResumeClaim`, `RestoreBlindRetry`, `GcSweep` | none: mutant-only actions | – |
+
+Op rows are the request/answer split: `ops(id, kind, sess, gen, arg, st
+Pending|Unknown|Done|NotDone, sent_at, attempts, inc)`. Recovery resolves
+them by observation (`Start` -> `RecoverOps`, then `pollOps` -> `OpResolve`
+once `Executor.Settled`).
+
+**"Driven by the same transitions."** `internal/lifecycle/replay_test.go`
+reads the ITF traces from `gen_traces.sh`:
+- the scripted design runs;
+- a greedy cover of random `--mbt` design runs (traces that add an action,
+  or an action pair).
+
+For each step it applies the same action with the same picks to `Ctl`,
+commits it to a SQLite `Store` (reloading from it at every `CtlCrash`), and
+compares the full controller state with the model's. The checked state is
+the rows, ops, drivers, observations, clock, incarnation and counters.
+
+Result: 189 traces (34 scripted, 155 random), 16051 steps, every design action exercised, Go equal to the model after every step.
+
+Positive controls, each injected into the Go code and reverted:
+- no epoch bump at commit: 22 traces fail;
+- `ResumeAbort` disabled: 1 fails;
+- the expiry TTL off by one: 3 fail.
+
+## What SR1–SR5 must provide
+
+- **SR1 (jails, services)** implements `Backend` for kinds `jail` and
+  `service`:
+  - `Quiesce` is `jail_remove` and a wait for every process to exit, with an
+    explicit kill: closing the jail descriptor does not.
+  - `Checkpoint` takes the ZFS snapshot and writes the service spec as the
+    artifact.
+  - `Restore` recreates the service jail from the spec under the
+    create-only name `(session, gen)` and waits for readiness.
+  - `InFlight` reports from jail names, dying jails and the spawner's
+    process descriptors.
+  - `Instance` comes from `jls`.
+- **SR2 (Firecracker)** implements `fc`:
+  - `Quiesce` pauses the VM.
+  - `Checkpoint` takes the snapshot into the artifact path on the
+    encrypted dataset and returns its bytes.
+  - `Restore` loads the snapshot under a unique VM id `(session, gen)` and
+    resumes it; a second load with that id fails.
+  - `InFlight` uses the jailer pidfile.
+  - The guest agent's resume epoch is the row's generation.
+  - The broker treats the vsock reset as retryable.
+  - Policy: suspend at turn boundaries.
+- **SR3 (bhyve)** implements `bhyve`:
+  - `Checkpoint` is `bhyvectl --suspend`; `Restore` is `bhyve -r`.
+  - `CheckpointOK` checks the files' sizes and digest.
+  - If the spike fails, the kind falls back to `service` (cold boot plus
+    spec).
+- **SR4 (engine KV)** implements `kv`:
+  - `Checkpoint` spills paged KV and the recurrent state.
+  - `Restore` restores it, or reports not done so that resume
+    re-prefills.
+  - `Instance` is the engine session id.
+- **SR5 (scheduler)**:
+  - Calls `Machine.Resume` with `Machine.Token` for internal triggers.
+  - Owns the message payload queue: `Deliver` is atomic in this model, and
+    that row is open.
+  - Picks which sessions to suspend under memory pressure. Today
+    `SuspendBegin` fires on idle alone; SR5 adds an LRU or pressure policy
+    on top of the same guard.
+  - Wires `Machine.Poll` to a timer.
+- **The broker and STS:**
+  - `Minter.Mint` must refuse an epoch other than the row's current one.
+  - The broker must honour only the current epoch (I3 depends on both).
+  - `ActivitySource` is the broker's count of model and tool calls per
+    session.
+- **Facts.** `FactSink` takes `yard.fact/v1` records:
+  - `yard.fact.type=tool_outcome`, `gen_ai.evaluation.name=yard.lifecycle.<name>@v1`,
+    source EXECUTOR;
+  - names: suspend (decision to commit in ms, checkpoint bytes), resume
+    (token consume to complete in ms, suspended ms), suspend_abort,
+    resume_abort, fail, expire.
+  - The OTel exporter is not built here.
+
+## Decisions (user, 2026-10-07)
+
+1. **The message queue is owned by yard-ctl**, beside the lifecycle store
+   (same encrypted dataset, its own table). Today the row's `inbox` count is
+   all that exists.
+   - SR5 modelling item: delivery to the harness (X12, atomic here) becomes
+     request / effect / answer.
+   - Its effect is the harness acknowledging the message; a lost answer
+     means redelivery, so messages need ids and the harness must dedupe.
+   - A message may be removed from the queue only after the answer is
+     Done.
+2. **Credential epoch, enforced now** (`internal/issuer/epoch.go`).
+   - Session tokens carry `yard_sess` and `yard_epoch`. The epoch is the
+     row's `CredEpoch`, bumped by `SuspendCommit`; `lifecycle.Machine`
+     implements `issuer.EpochSource`.
+   - The issuer refuses to mint for any other epoch (`ErrStaleEpoch`).
+   - `issuer.VerifyEpoch` is the broker-side check (the warden model's
+     broker-side epoch check uses the same rule): it rejects a token whose
+     epoch is not the session's current one.
+   - The verifier also closes a race: a mint checked just before the bump
+     and signed just after carries the old epoch, so it is rejected.
+   - `TestI3NoEpochMutantBreaks` is the Go counterpart of `noCredEpoch`:
+     without both checks, a refresh requested before the suspend and
+     answered after the resume is honoured.
+3. **One yard-ctl per database, enforced.** `lifecycle.OpenOwned` takes an
+   exclusive non-blocking `flock` on `<db>.lock`. It fails fast with
+   `ErrOwned`, naming the holder's pid and the lock path. `OpenStore` stays
+   for secondary handles. This makes assumption A3 a check.
+4. **SR1/SR2 requirement: dead-instance detection while Active.** Each
+   backend runs a health check (SR1: `jls` / process descriptor exit; SR2:
+   VMM process and API socket). A dead instance of an Active or Idle
+   session is a lifecycle event: today it would be Failed, or restarted
+   from the service spec for SR1 kinds. Model it in Quint (an Active-state
+   counterpart of `InstanceCrash` with a controller reaction) before coding
+   it.
+5. **Production metrics per unknown-outcome class** (AMBIGUITY.md rule 5).
+   - The hook exists: a `FactSink` that also implements
+     `lifecycle.OutcomeCounter` gets `CountOutcome(kind, class)` for
+     answer_done, answer_error, answer_ignored, timeout, restart_unknown,
+     resolved_done, resolved_not_done and retry.
+   - Requirement for when the backends are real: export these as OTel
+     counters per kind and class, and alert on resolved_not_done and
+     restart_unknown rates.
+
+## SR1: the service backend and the pause tier (2026-10-07)
+
+`internal/service` implements kind `service`:
+- **Quiesce** stops every process of the instance's jail: SIGTERM once per process, SIGCONT to stopped ones,
+  re-listing for new ones, SIGKILL after `stop_grace`, then it verifies none is left. The jail stays, because the
+  checkpoint needs an instance (model `OCheckpoint` effect). Closing a jail descriptor does not kill.
+- **Checkpoint** takes `zfs snapshot <ws>@ysr1-<sess>-g<gen>-c<ckpt>` and a digested spec artifact.
+- **Destroy** is jail_remove plus a wait for the processes, then unmount.
+- **Restore** recreates the jail `(sess, gen)` through `spawn.Start` and waits for readiness. A timeout removes it,
+  so it is observed not done.
+- **Unquiesce** sends SIGCONT, or starts the service again in its jail.
+- **Pause/Unpause** send SIGSTOP/SIGCONT and check the result.
+- `InFlight` is the op's flock, which zfs and shim children inherit.
+
+The pause tier is in the model: state `Paused`, phases `PPause`/`PUnpause`, ops `OPause`/`OUnpause`,
+`Inst.frozen`, policy `pause`/`suspendHold`. A paused session is suspended straight from `Paused` after
+IDLE_TIMEOUT + suspendHold. The quiesce of a frozen instance stops it (SIGTERM + SIGCONT). The rows that use it:
+`designPause`, `unpauseBeforePauseSettles`, `retrySupersededOp`, and `pauseScripts` (11 runs). The pause actions
+are one nested branch at the end of `ctlStep`.
+
+**Defect found by the model, SR0 and SR1:** `OpRetry` resent any not-done retryable op, even after the row had moved on:
+- SR1: a lost SIGSTOP was resent while the SIGCONT was out (first `designPause` run: I8 broke).
+- SR0: the same shape lets a superseded quiesce kill the service the abort restarted.
+
+Rule `RETRY_CURRENT`; Go `Ctl.OpRetry` now checks `opCurrent`.
+
+**Seed luck corrected:** `recoverAssumesNotDoneFocus` "breaks (~570)" did not reproduce on the committed SR0 model
+at seeds 0x5eee, 0x1, 0x2 (0/9000). The new focused step `stepCrashCkpt` (crash only while a checkpoint copy is in
+flight, a restriction of `step`) breaks it in ~80 traces. The three plain-`step` rows that random sampling misses
+are now expected `either` in `run_models.sh`; their focused rows and BreaksTests are the checks.
+
+### SR1 results (2026-10-07, `sh run_models.sh`, seed 0x5eed, 3000 x 100)
+
+| Instance | Step | Invariant | Expected | Result |
+|---|---|---|---|---|
+| `design`, `design2`, `designPause` | `step` | all (I1-I8) | holds | holds (~2860-3120 traces each) |
+| `unpauseBeforePauseSettles` | `step` | I8 | breaks | **breaks** (~277) |
+| `retrySupersededOp` | `step` | I8 | breaks | **breaks** (~1074) |
+| `recoverAssumesNotDoneFocus` / `...FocusDesign` | `stepCrashCkpt` | I4 / all | breaks / holds | **breaks** (~76) / holds |
+| other 11 SR0 mutants, focused rows | as above | | | as expected |
+| `blindRestoreRetry`, `noCredEpoch`, `snapshotBeforeQuiesce`, `expireDropsInbox`, `recoverAssumesNotDone` | `step` | | either | held (random runs miss them; the focused rows and BreaksTests catch each) |
+
+Scripted: 17 modules, 0 failing (`pauseScripts` 11/11, both new BreaksTests). 0 rows off expectation.
+`designPause` witnesses (3000 traces): `wPaused` 233, `wUnpaused` 32, `wSuspendFromPaused` 177,
+`wAdoptPaused` 63, `wPauseNotDone` 337. Replay: 222 traces (45 scripted), 18389 steps, all pause actions
+exercised, Go equal to the model after every step.
+
+## SR1 decisions of 2026-10-07: workspace keys, drift refusal, liveness
+
+The design (yard STATE.md SR1, CONTROL-PLANE.md "Workspace layout") is modelled here around suspend and
+resume. The key service with both of its consumers (ZFS workspace keys and halo_serve spill keys) has its own
+model, `spec/keys` (README, `run.sh`, `results.txt`: failures 0).
+
+- **Layout D.** A session may have a project (`PROJECT`). A resume first goes through phase `PKey`:
+  - `ResumeLoadKey` sends `OLoadKey` (load-key from stdin, then mount the clone), but only once the project's
+    unload is resolved (`KEY_FENCE`).
+  - `ResumeKeyDone` then sends the restore.
+  - A project's key is unloaded through `KeyUnloadBegin` (`OUnmount`), then `KeyUnmountDone` (`OUnloadKey`),
+    then `KeyUnloadDone`. It starts only when every session of the project is Suspended, Expired or Failed,
+    with no driver and no load unresolved (`KEY_GUARD`).
+  - The project ops are op rows whose `sess` is the project. Their retries, timeouts and recovery
+    (`RecoverProjOps`) follow the rules of the other ops.
+  - The environment treats the unmount as forced (the design does not count on EBUSY). Unload-key refuses
+    while anything is mounted, as in ZFS.
+- **Decision 2.** The workspace is not rolled back at restore. `WorkspaceEdit` changes it while the session is
+  suspended. Unless the op carries the override (`ResumeConsumeForce`, `Op.force`), the restore refuses:
+  - the answer is the definite `Refused`;
+  - `ResumeAbort` records `drift` and issues a fresh token.
+- **Decision 3.** Each awake session has a volatile probe:
+  - `ProbeReq` records the row's instance and generation.
+  - `ProbeExec` reads the instance; `ProbeAnswer` comes later.
+  - `ProbeTimeout` is unknown.
+  - `LostDetect` takes the session to Failed only on "not alive" for the current instance and generation
+    (`PROBE_CURRENT`).
+
+Results (`sh run_models.sh`, seed 0x5eed, 3000 x 100, 2026-10-07): **failures 0**. All design instances hold
+I1-I11, every mutant breaks its invariant, and all 25 scripted modules pass. The new rows:
+
+```
+checkpointTimeoutNotDone	stepCore	artifactsAccounted	breaks	breaks	~1770 traces	OK
+commitBeforeDestroy	stepCore	resumedAtMostOnce	breaks	breaks	~407 traces	OK
+deadOnProbeTimeout	step	noLiveFailed	breaks	breaks	~14 traces	OK
+design2	step	allInvariants	holds	holds	~3221 traces	OK
+designKeys	step	allInvariants	holds	holds	~2946 traces	OK
+designPause	step	allInvariants	holds	holds	~3010 traces	OK
+design	step	allInvariants	holds	holds	~3079 traces	OK
+loadDuringUnloadFocusDesign	stepQuiet	allInvariants	holds	holds	~3268 traces	OK
+loadDuringUnloadFocus	stepQuiet	keyUnderActive	breaks	breaks	~313 traces	OK
+loadDuringUnload	step	keyUnderActive	either	holds	~2836 traces	OK
+resumeIgnoresDriftFocusDesign	stepDrift	allInvariants	holds	holds	~2864 traces	OK
+resumeIgnoresDriftFocus	stepDrift	noSilentDrift	breaks	breaks	~33 traces	OK
+resumeIgnoresDrift	step	noSilentDrift	either	holds	~2881 traces	OK
+resumeWithoutKey	step	keyUnderActive	breaks	breaks	~8 traces	OK
+staleProbe	step	noLiveFailed	breaks	breaks	~183 traces	OK
+unloadUnderActive	step	keyUnderActive	breaks	breaks	~1 traces	OK
+unpauseBeforePauseSettles	stepCore	noFrozenAwake	breaks	breaks	~295 traces	OK
+resumeIgnoresDriftScripts	1 passing, 0 failing
+deadOnProbeTimeoutScripts	1 passing, 0 failing
+staleProbeScripts	1 passing, 0 failing
+unloadUnderActiveScripts	1 passing, 0 failing
+loadDuringUnloadScripts	1 passing, 0 failing
+resumeWithoutKeyScripts	1 passing, 0 failing
+```
+
+Notes.
+- **`stepCore`.** The new actions (probes, edits, key actions) take steps and simulator weight. Three older
+  mutants that plain `step` runs found before (`checkpointTimeoutNotDone`, `commitBeforeDestroy`,
+  `unpauseBeforePauseSettles`) held in a first run at 3000 samples. They now run on `stepCore` (`step` without
+  the SR1 actions), where they break as before. Their scripted BreaksTests run on the full model.
+- **Two mutants random runs miss.** `resumeIgnoresDrift` and `loadDuringUnload` have focused rows (`stepDrift`;
+  one session with `stepQuiet`) and scripted BreaksTests.
+- **Replay.** The Go replay drives `internal/lifecycle` through 361 traces (31,253 steps), including
+  `designKeys`, `sr1Scripts` and `keysScripts`. It compares rows, ops, projects and probes after every step.
+- **Go-only fields.** `Row.Project` holds the model's `PROJECT` const. `Config.ProbeEvery` is the probe period.
+  Machine does not auto-resume a Drift row on a held message (the alternative is a refusal loop; it is not a
+  safety property, so it is not modelled).
+
+## SR1 round 2 (2026-10-07): the jail on its clone, Removed
+
+- **JAIL_FIRST.** I11 `keyUnderActive` now covers every instance, running or stopped (its jail mounts the
+  clone). A project unloads only when each session is key-idle: Suspended, Expired, Failed or Removed, with
+  no driver, and with the op the row waits on **done**.
+  - The model found that "resolved" was not enough: a removed session's destroy known not done leaves the
+    jail, and its view of the clone, in place.
+  - Mutant `unmountBeforeJailRemove`: the unload starts once a suspend has only sent its destroy.
+- **Removed** (`yard-svc down`): `Remove` takes any quiet session (not one a suspend or resume is driving,
+  `REMOVE_GUARD`) to Removed.
+  - Its live instance is destroyed and the row waits on that destroy; the checkpoint delete is owed; the
+    token and held messages are dropped. Removed is terminal.
+  - I12 `removedInert`: once its destroy is done, a Removed session has no live instance.
+  - Mutant `removeWhileResuming`: the restore lands after the destroy.
+- **`stepRemove`.** `Remove` is terminal and enabled from the start. Inside `step` it ended most random
+  traces early: in a first run, ten older mutants went undetected at 3000 samples. It now runs only in
+  `stepRemove`, one branch in nine and only from tick 4 on (and `stepQuietRemove` for the focused rows).
+  `gen_traces.sh` adds `designKeys` traces under `stepRemove`; the replay maps their `rs` pick.
+
+Results: `run_models.sh` **failures 0** (seed 0x5eed, 3000 x 100); the new rows:
+
+```
+design2	stepRemove	allInvariants	holds	holds	~2924 traces	OK
+designKeys	stepRemove	allInvariants	holds	holds	~2975 traces	OK
+removeWhileResumingFocusDesign	stepQuietRemove	allInvariants	holds	holds	~2896 traces	OK
+removeWhileResumingFocus	stepQuietRemove	removedInert	breaks	breaks	~4 traces	OK
+removeWhileResuming	stepRemove	removedInert	either	breaks	~136 traces	OK
+unmountBeforeJailRemove	stepRemove	keyUnderActive	breaks	breaks	~23 traces	OK
+unmountBeforeJailRemoveScripts	1 passing, 0 failing
+```
+
+The replay covers 399 traces and 34,489 steps (92 of them `Remove`).
+
+## When to update
+
+Change `lifecycle.qnt` first and re-run `run_models.sh`. Then change
+`internal/lifecycle` to match, regenerate traces with `gen_traces.sh`, and
+run `go test ./internal/lifecycle/`. Never edit the model to match the code.
+
+## Load-order refinement and quintgo adoption (2026-10-08)
+
+Native reproduction `20261008T200436Z` found `written@snapshot` 0 before/unmounted and 8192 after remount,
+with identical recorded file hashes/metadata, empty logical diff and a detected positive-control edit.
+The mount stack dirtied the dataset through ZIL housekeeping. This falsified the assumption that mounting
+was harmless before the physical-drift observation; it did not justify a byte tolerance or implicit force.
+
+X16 and `lifecycle.Keys` now mean **key-only load/observation**. X19 owns the mount after drift acceptance.
+`OLoadKey` changes only `keys`; `ORestore` changes `world.mounted` after its drift guard. `keyCycleDesignTest`
+asserts both boundaries. A partial service restore may leave unacknowledged physical writes (mount metadata
+and/or startup files), then clean up without a ready instance. `failedRestoreEditRetryDesignTest` covers abort,
+refused retry and explicit forced retry; token claims, successful-ready-restore and one-instance fences remain.
+
+The physical-drift rule stays conservative across retries: once a mount/start attempt was accepted, it may
+have dirtied the checkpoint even when no instance remains or no application file changed. A later positive
+`written@` still requires explicit override. No 8192-byte subtraction, automatic force or checkpoint rebasing
+is performed. The native T case now verifies that failed-start writes cause refusal, then uses explicit force.
+The legacy no-project fake test has no remount; the project-specific metadata-only failure regression covers
+the native case. Explicit-admin `ws-load` remains load+mount and may similarly leave physical drift.
+
+The core model's partial-write marker abstracts checkpoint dirtiness, not a claim that a namespace edit
+occurred. `load_order.qnt` separately models observed I/O ordering and the fixture's mount-metadata effect.
+It is a monitor of completed/key/guard facts and mount request/effect/answer boundaries, not a replacement
+for the full lifecycle request/effect/answer/crash model. Its 8192 constant is a fixture parameter, not a
+universal ZFS write size.
+
+We now reuse `github.com/casselc/observability/quintgo` at `ca7ae8a6250f` (pinned in go.mod/go.sum):
+- `itf` decodes traces and `connect.Driver` dispatches the explicit action binding, rejects unknown actions,
+  compares controller state after every step and retains SQLite crash/reload checks.
+- `qobs` records actual backend calls against the fake OS, in a local MemorySink with a dense recorder
+  sequence, explicit thread and process. `validate.Checker` checks the `load_order_binding.yaml` mapping.
+  Correct order, genuine-edit refusal and explicit override conform; the old composite-load order is an
+  illegal transition, and a dropped observation is rejected as a gap/incomplete trace.
+- Toolkit imports are test-only. No production weaving, exporter or OTel pipeline is enabled by this change.
+  Runtime production step capture remains an integration item; successful fake-OS conformance is not a native gate.
+
+Mandatory host gate: `sh tools/check-load-order.sh` fails if the Quint CLI is absent, then runs conformance,
+backend regressions and archived ITF replay. Native test binaries may explicitly skip the optional checker
+when Quint is unavailable. The shell model runner now separates tool/parser failures from holds/violations
+and exits nonzero on any failed row. Regenerate and archive the corpus with every model refinement.
+
+Closeout verification: fresh corpus **400 traces (2.9MB)**, replay and full `go test -race ./...` pass;
+40/40 planted mutants caught; model rerun (44 simulation rows, 27 scripted modules, 3000 × 100,
+seed 0x5eed) reports failures 0, including 9 keysScripts. The earlier 399/34,489 count is historical round 2.
+FreeBSD crossbuild passes. Native lifecycle rerun with the corrected binary remains pending.
+
+Integration distinction: `service.Backend` implements the lifecycle's key-only `Keys` contract. Consumers
+requiring an explicit workspace-admin mount use `Workspaces.LoadKey` or their own guarded restore path;
+the planned keysvc wiring must not assume a `lifecycle.Keys.LoadKey` also mounts a workspace.
+
+## Manual operator scope and orphan cleanup (native follow-up)
+
+Run 20261009T005205Z passed 10 cycles, drift override, kill escalation and readiness-timeout handling,
+then exposed frontend boundaries. A command's policy had been applied to every row of class `sr1`:
+suspending `kill` silently suspended `web`. `Config.SessionPolicies` now provides the model's per-session
+POLICY mapping without rewriting persisted run classes; the CLI uses a keep-warm class default and only
+overrides its target session. Machine pause selection and controller guards use the same resolver.
+Two same-class/shared-project regressions verify target suspend/pause leaves the peer Active and its key loaded.
+
+Bare external `jail -r` can leave nullfs mounts after Instance reports absent. Those backend resources are
+not represented by the core model's instance set. Manual down now commits the Removed fence, waits for
+session effects (including its destroy-done fence), cleans backend leftovers, THEN awaits project cleanup.
+It no longer waits for a project unmount blocked by the mounts it has yet to clean. Cleanup errors stop the
+operator path; they never authorize key release. `SessionOpsSettled` deliberately excludes project work.
+Cleanup retains the backend session record until project settlement, so an interrupted wait can be
+retried and outstanding checkpoint Delete/Exists calls can still resolve the dataset after physical cleanup.
+The operator path assumes one operator at a time; concurrent double-down can reject a stale remove request.
+The retry regression interrupts project waiting, checks late checkpoint Delete/Exists after physical
+cleanup, retries successfully, and verifies record retirement. Follow-up verification passes the mandatory
+conformance gate, full race suite, FreeBSD crossbuild and 41/41 mutants (including early metadata retirement).
+
+`operator_remove.qnt`/YAML is a separate quintgo order monitor for this resource boundary. Recorded callbacks
+run the same RemovalStages used by the CLI against the backend fake OS with a genuinely orphaned view.
+The corrected order conforms; pre-cleanup project waiting is disabled. Ordinary cleanup-failure tests
+ensure project completion is not called on an unknown/error result. This is backend/operator conformance,
+not a claim that the core lifecycle model covers all external mount leaks or arbitrary kernel resources.
+
+The workspace shred precheck recognizes Removed rows, but refuses a Removed row still awaiting destroy
+completion. The filesystem's non-forced unmount/unload checks remain required before wrapped-key deletion.
+These frontend changes do not alter the core model's transition schema or its archived trace corpus.
+
+Native follow-up20261010T164531Z on FreeBSD15.1-STABLE: full SR1 GATE PASS (0 mismatches),
+10/10 cycles and D/K/T/P/X/L/S checks, exit0. Binary/harness hashes match the local uncommitted correction.
+Paired cycle-wall p50 is573.309ms, inside1000ms+ready32.989ms; destroy/lifecycle-suspend/start-to-ready
+component predictions remain outside their original ranges. See STATE.md for artifacts and provenance.

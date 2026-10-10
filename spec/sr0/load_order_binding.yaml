@@ -1,0 +1,24 @@
+# A test-time qobs native-step binding, no OTel exporter or production weaving.
+spec: load_order.qnt
+module: loadOrder
+constants:
+  MOUNT_METADATA: '8192'
+actions:
+  key_ready:
+    args:
+      loaded: '{{.loaded}}'
+      mounted: '{{.mounted}}'
+  observe:
+    args:
+      n: '{{.written}}'
+      force: '{{.force}}'
+  mount_request: {}
+  mount_effect:
+    args:
+      n: '{{.written}}'
+    expect: 's.mounted == {{.obs.mounted}} and s.physical == {{.obs.physical}}'
+  mount_answer: {}
+invariants:
+  - noMountBeforeAcceptance
+  - realDriftNeedsOverride
+  - observedBeforeMount

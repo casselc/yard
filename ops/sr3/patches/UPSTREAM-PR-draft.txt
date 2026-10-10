@@ -1,0 +1,177 @@
+DRAFT -- not filed. Target: bugs.freebsd.org, Product "Base System", Component "bhyve".
+
+Summary: bhyve snapshot: restoring a boot-ROM (UEFI) guest leaves all PCI BARs unregistered; guest I/O hangs
+
+Version: 15.1-STABLE stable/15-n285848-fabb224f2f15 (amd64, Intel VMX), bhyve built WITH_BHYVE_SNAPSHOT,
+vmm.ko with options BHYVE_SNAPSHOT. Code unchanged on main as of b27a221ef79d.
+
+How to reproduce:
+1. Boot a FreeBSD 15.1-RELEASE guest with edk2-bhyve:
+   bhyve -c 2 -m 2560M -l bootrom,/usr/local/share/uefi-firmware/BHYVE_UEFI.fd -u -A -H -P \
+     -s 0,hostbridge -s 1,lpc -s 2,virtio-blk,disk.img -s 3,virtio-net,tap0 -l com1,stdio vm
+   with a guest process that writes to the disk every second.
+2. bhyvectl --vm=vm --suspend=vm.ckp   (completes; bhyve exits)
+3. bhyve -c 2 -m 2560M -r vm.ckp <same device and -l bootrom arguments> vm
+
+Result: the guest never makes progress again. Its vCPUs idle in hlt and keep taking LAPIC timer
+interrupts, but every disk (and network) operation blocks forever. The same guest booted with
+bhyveload suspends and restores fine (50/50 in our test).
+
+Cause: with a boot ROM, pci.enable_bars defaults to false (e962b37bf0ff), so at startup bhyve does
+not register any BAR's I/O or MMIO handler; normally the firmware's write to the command register
+does that, at the addresses the firmware chose (which can differ from bhyve's own assignment: here
+the two virtio MSI-X BARs were swapped). On restore, pci_snapshot_pci_dev() restores pi_bar[].addr
+and pi_cfgdata (decode bits set) but never registers the BARs, so the restored guest's accesses to
+its devices' I/O ports go to the default inout handler (writes dropped, reads 0xff) and MMIO is
+unbacked. Virtio queue notifications are lost, so I/O never completes.
+Without a boot ROM the same code leaves the handlers at bhyve's original BAR addresses, which is
+only correct if the guest never reprogrammed a BAR.
+
+Workaround: pass -o pci.enable_bars=true to the restoring bhyve (only correct if the firmware happened
+to choose bhyve's default BAR addresses).
+
+Proposed fix (attached diff, against fabb224f2f15): in pci_snapshot_pci_dev(), on
+VM_SNAPSHOT_RESTORE, clear PORTEN/MEMEN and call pci_emul_cmd_changed() to unregister the
+pre-restore BARs before reading the saved state, then call pci_emul_cmd_changed() with the restored
+command register minus its decode bits so that every restored BAR whose decoding is enabled is
+registered (this also invokes pe_baraddr, so e.g. fbuf maps its framebuffer at the restored BAR).
+
+Results (NUC, Intel N150, FreeBSD 15.1-RELEASE guest, 2 vCPU / 2560M; run ids are UTC start times):
+- A, unpatched, UEFI, restore with -o pci.enable_bars=true (workaround): 3/3 restores done, state intact
+  (20261007T173542Z).
+- B, unpatched, bhyveload, restore with -o pci.enable_bars=false (negative control: nothing
+  registered, as with a boot ROM): 3/3 restores hang exactly like UEFI (20261007T173757Z).
+- With the fix (variant p1), bhyveload: 50/50 suspend + restore done, state intact (20261007T175102Z).
+- With the fix, UEFI: 50/50 restores done; 48 with state intact, 2 (restores 17 and 27) classed
+  corrupt by our harness from a half-written console line (the guest's next ticks show the same
+  process and memory continuing; harness fixed) (20261007T174412Z). To verify before filing: a clean
+  rerun of the UEFI case (planned with variant p3, which contains this fix unchanged).
+
+----------------------------------------------------------------------------------------------
+SECOND REPORT (separate PR), DRAFT -- not filed.
+
+Summary: bhyve snapshot: ACPI PM/GPE0 state is not snapshotted and the VM generation counter is never
+signalled on restore (restored guests do not reseed; SIGTERM no longer powers them off)
+
+Version: as above.
+
+1. usr.sbin/bhyve/amd64/pm.c has no snapshot hook. pm1_enable, pm1_status, pm1_control (SCI_EN),
+   gpe0_enabled and gpe0_active come back as 0 after `bhyve -r`. Consequences: no GPE can raise an
+   SCI in a restored guest, and because the guest enabled ACPI (SMI_CMD BHYVE_ACPI_ENABLE) before the
+   snapshot, the SIGTERM power-button mevent is never installed in the restoring bhyve, so
+   `kill -TERM <bhyve>` no longer shuts a restored guest down (PM1 PWRBTN_EN is 0 as well).
+2. vmgenc.c: vmgenc_init() writes a random generation ID on every bhyve start, including a restore
+   (the ID page is a bootrom_alloc page outside guest RAM, so it is not in the snapshot), but the GPE
+   that would make the guest re-read it is compiled out ("XXX When we have suspend/resume/rollback").
+   A restored guest -- and every guest restored from the same snapshot -- keeps its pre-snapshot
+   kernel RNG state without being told; FreeBSD's vmgenc(4) would feed the new ID into Fortuna pool 0
+   (random_harvest_direct, RANDOM_PURE_VMGENID) and Linux's vmgenid would call
+   add_vmfork_randomness() (crng reseed, vDSO getrandom generation bump, NEW_VMGENID uevent).
+
+Proposed fix (attached diff, against fabb224f2f15 + the BAR fix): pm_snapshot() saves/restores the PM1
+and GPE0 registers and sci_active as device "pm" (restore accepts older snapshots without it) and
+re-installs the power-button handler if SCI_EN was set; vmgenc_restore(), called after devices, PM state
+and kernel state are restored and before the vCPUs are resumed, writes a fresh ID and raises
+GPE_VMGENC. A live --checkpoint does not change the running VM's generation ID.
+
+Results with the fix (variant p2 = BAR fix + this):
+- Same snapshot restored 5 times (UEFI, 20261007T181044Z): 5/5 done, every restore gen=chg (the guest
+  read a new ID), 5 distinct IDs, 5 distinct RNG reads; 4/5 devd notifications seen one tick after the
+  restore (the fifth not yet: our harness now waits up to 5 ticks). But SIGTERM powered the restored
+  guest off 0/5 times.
+- Fresh suspend/restore cycles (UEFI 20261007T175750Z, bhyveload 20261007T180426Z, N=50 each): only
+  the FIRST restore after each cold boot got the notification (gen=chg vgev=+1); every later one
+  gen=same vgev=+0. (Two bhyveload rows that look different, restore 3 vgev=-1 and restore 10 gen=chg,
+  match our harness's half-written-console-line defect: a missing vg field reads as 0.)
+Both are a vmm.ko bug, not this patch: after the first SCI of a restored VM, the SCI pin's Remote IRR
+is never cleared (THIRD REPORT). To verify with that fix (variant p3): every restore gen=chg and
+vgev>=1 in 50-cycle runs, and SIGTERM powers a restored guest off (same-snapshot 5/5, and the guest at
+the end of a 50-restore chain).
+
+----------------------------------------------------------------------------------------------
+THIRD REPORT (separate PR, kernel: sys/amd64/vmm), DRAFT -- not filed.
+
+Summary: vmm: after a snapshot restore with APICv, level-triggered interrupts stop after the first one
+(VMCS EOI-exit bitmap not rebuilt; ACPI SCI wedged, power button ignored)
+
+Version: as above; Intel N150 with virtual interrupt delivery and posted interrupts
+(hw.vmm.vmx.cap.virtual_interrupt_delivery=1, hw.vmm.vmx.cap.posted_interrupts=1).
+
+With virtual interrupt delivery, a guest EOI exits to vmm only for vectors set in the VMCS EOI-exit
+bitmap. vmx_set_tmr() keeps that bitmap equal to the vlapic TMR, and the TMR is only ever computed by
+vioapic_update_tmr(), which runs when the guest writes an IO-APIC redirection entry. A restored VM is a
+new VM: vmx_vcpu_init() zeroes EOI_EXIT0-3, vioapic_snapshot() restores rtbl[].reg/acnt and
+vlapic_snapshot() the APIC page (TMR bits included), but nothing reprograms the bitmap, and the guest
+does not rewrite its redirection entries. The restored guest's EOI for a level-triggered vector is
+therefore completed by the CPU without an exit, vioapic_process_eoi() never runs, Remote IRR stays set
+and the pin delivers nothing more. A snapshot taken later carries Remote IRR=1 for that pin, so every
+descendant restores with the pin already wedged.
+
+Seen with the ACPI SCI (IRQ 9, level-triggered) and the VM-generation notify from the second report:
+- cycles (each restore from the previous restore's snapshot): only the first restore after a cold boot
+  got the notification, all later ones none (20261007T175750Z UEFI, 20261007T180426Z bhyveload);
+- the same snapshot (taken from a cold-booted guest) restored 5 times: the notify arrived every time,
+  and the following SCI (the power button on SIGTERM) never did: 0/5 power-offs (20261007T181044Z).
+Any level-triggered INTx device behaves the same after a restore; virtio and ahci use MSI-X, which is
+why nothing else showed it. AMD SVM, and VMX without virtual interrupt delivery, trap every EOI to
+vlapic_process_eoi(), which reads the restored TMR from the APIC page: not affected.
+
+Proposed fix (attached diff 0003, against fabb224f2f15): vioapic_restore_tmr() runs vioapic_update_tmr()
+for every vCPU; vm_snapshot_req() calls it after restoring STRUCT_VIOAPIC and STRUCT_VLAPIC (all vCPUs are
+frozen by the ioctl; bhyve has activated them before it restores). Snapshots taken under an unfixed
+module after the first level interrupt keep Remote IRR=1 (a real IO-APIC clears it only on EOI; vmm
+cannot tell a lost EOI from a guest still in its handler) and have to be retaken.
+
+Results with the fix: (with 0001-0004, variant p4; the p3 runs were skipped for p4)
+- cycles, N=50 each, idle guest: UEFI 20261007T190918Z and bhyveload 20261007T191617Z: 50/50 restores done,
+  state intact, every restore gen=chg with >=1 notification, SIGTERM powers the final restored guest off.
+- same snapshot restored 5 times (UEFI, 20261007T194936Z): 5/5 gen=chg vgev=+1, 5/5 SIGTERM pwr=off
+  (unpatched p2: 5/5 pwr=killed).
+Control without the fix: with virtual interrupt delivery disabled (hw.vmm.vmx.use_apic_vid=0) the base module
+powered the restored guest off with SIGTERM (20261007T195236Z, final_pwr=off), as expected when EOIs always
+trap; that run's restore hangs are a separate issue (see the fourth report).
+----------------------------------------------------------------------------------------------
+FOURTH REPORT (separate PR, kernel: sys/amd64/vmm), DRAFT -- not filed.
+
+Summary: vmm: with APICv, restoring a snapshot of a guest that was busy with interrupts panics the host
+("ISR and isrvec_stk out of sync")
+
+Version: as above; Intel N150 with virtual interrupt delivery and posted interrupts
+(hw.vmm.vmx.cap.virtual_interrupt_delivery=1, posted_interrupts=1). vmm.ko built with BHYVE_SNAPSHOT.
+
+How to reproduce: ops/sr3/repro/apicv-restore-panic.sh (attached; standalone, root, disposable host):
+suspend a guest while the host ping-floods its virtio-net interface, restore it, repeat.
+<fill in: cycles to panic on an unpatched module, and the dmesg/backtrace from the dump>
+
+Result: host panic, panic string "ISR and isrvec_stk out of sync" (first seen 2026-10-07 14:41:51 EDT,
+2 s after the first restore of a guest that had been busy at suspend time; dump header good).
+
+Cause: vmx_vcpu_snapshot() does not save VMCS_GUEST_INTR_STATUS (RVI/SVI) or the posted-interrupt
+descriptor; the virtual-APIC page (with the hardware-maintained IRR/ISR) is saved by vlapic_snapshot().
+The restored VMCS has SVI = 0 while the restored ISR still has the in-service vector, so the guest's
+virtualized EOI clears the wrong bit and the vector stays in service. At the next HLT exit,
+vm_handle_hlt() (vmm.c:779) -> vlapic_pending_intr() -> vlapic_update_ppr() (vlapic.c:1237) runs the
+always-enabled (#if 1) consistency check, which assumes isrvec_stk mirrors the ISR; with virtual
+interrupt delivery isrvec_stk is never pushed (vmx_inject_interrupts() returns after vmx_inject_pir(),
+vmx.c:1545; vmx_intr_accepted() panics if called, vmx.c:3890), so the check panics (vlapic.c:543).
+Interrupts posted but not injected at suspend time are also lost.
+
+Proposed fix (attached diff 0004, against fabb224f2f15): vlapic_snapshot() calls two new vlapic ops,
+set by vmx only with virtual interrupt delivery: before saving the page, vmx_inject_pir() under
+VMPTRLD/VMCLEAR (what the next VM entry would do); after restoring it, RVI/SVI are recomputed from the
+restored IRR/ISR and written to VMCS_GUEST_INTR_STATUS. Recomputing keeps old snapshots restorable.
+
+Workaround: kenv hw.vmm.vmx.use_apic_vid=0 before loading vmm.ko (interrupt delivery without APICv).
+
+Results with the fix (variant p4 = 0001-0004, virtual interrupt delivery on, host ping flood during every
+suspend): UEFI 20261007T192321Z and bhyveload 20261007T193723Z, N=50 each: 50/50 restores done with state
+intact, 0 hangs, no host panic, gen/SIGTERM gates pass.
+Control without the fix: APICv off (hw.vmm.vmx.use_apic_vid=0), base module and bhyve, same load, N=10
+(20261007T195236Z): no host panic, but 2/10 restores hung (guest alive, no progress in 60 s; in one, the
+vlapic generated 0 timer interrupts after the restore). So APICv off avoids this panic but is not a clean
+workaround: there is a separate restore problem on the non-APICv path, not investigated yet (suspect: the
+one-shot LAPIC timer restored with an expired/zero current count).
+
+Separately (not part of this PR): the vlapic_update_ppr() consistency check is reached on the HLT path
+under virtual interrupt delivery whenever an ISR bit is set; whether that is reachable without a
+snapshot is a question for secteam@FreeBSD.org, not for a public PR.

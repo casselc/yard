@@ -1,0 +1,20 @@
+spec: operator_remove.qnt
+module: operatorRemove
+constants:
+  ORPHANS: 'true'
+actions:
+  fence:
+    args: { removed: '{{.removed}}' }
+  session_settled:
+    args: { done: '{{.done}}' }
+  cleanup_request: {}
+  cleanup_effect:
+    args: { views: '{{.views}}' }
+  cleanup_answer: {}
+  project_wait_request: {}
+  project_wait_failed: {}
+  project_settled:
+    args: { loaded: '{{.loaded}}' }
+invariants:
+  - cleanupAfterFence
+  - noKeyReleaseBeforeCleanup

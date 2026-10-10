@@ -1,0 +1,64 @@
+bhyve: re-register PCI BAR handlers when restoring a snapshot
+
+Against FreeBSD stable/15 fabb224f2f15 (applies with patch -p1 in the source root).
+
+pci_snapshot_pci_dev() restores pi_bar[].addr and the config space (command
+register included) but never moves the I/O-port/MMIO handler registrations.
+With a boot ROM, pci.enable_bars defaults to false (e962b37bf0ff), so restore
+starts with no BAR registered at all and the guest resumes with every
+device's I/O ports and MMIO unhandled (virtio notifications dropped, disk I/O
+never completes). Without a boot ROM the handlers stay at bhyve's own BAR
+assignment, which is only correct if the guest never moved a BAR.
+
+Fix: before reading the saved state, clear the decode bits and let
+pci_emul_cmd_changed() unregister whatever is registered; after it, let
+pci_emul_cmd_changed() register the restored BARs whose decoding is enabled
+(this also calls pe_baraddr, e.g. fbuf remaps its framebuffer).
+
+--- a/usr.sbin/bhyve/pci_emul.c
++++ b/usr.sbin/bhyve/pci_emul.c
+@@ -2497,11 +2497,30 @@
+ pci_snapshot_pci_dev(struct vm_snapshot_meta *meta)
+ {
+ 	struct pci_devinst *pi;
++	uint16_t cmd;
+ 	int i;
+ 	int ret;
+ 
+ 	pi = meta->dev_data;
+ 
++	/*
++	 * Restore replaces the BAR addresses and the command register.  The
++	 * I/O and MMIO handlers registered for the BARs must follow them:
++	 * drop every registration made for the pre-restore state (bhyve's own
++	 * BAR assignment, when pci.enable_bars is set) before the new state is
++	 * read, and register the restored BARs afterwards.  Without this a
++	 * guest whose firmware assigned the BARs (any boot ROM, where
++	 * pci.enable_bars defaults to false and nothing is registered at
++	 * startup) resumes with no handlers for its devices' I/O ports and
++	 * MMIO, and e.g. virtio queue notifications are silently dropped.
++	 */
++	if (meta->op == VM_SNAPSHOT_RESTORE) {
++		cmd = pci_get_cfgdata16(pi, PCIR_COMMAND);
++		pci_set_cfgdata16(pi, PCIR_COMMAND,
++		    cmd & ~(PCIM_CMD_PORTEN | PCIM_CMD_MEMEN));
++		pci_emul_cmd_changed(pi, cmd);
++	}
++
+ 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msi.enabled, meta, ret, done);
+ 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msi.addr, meta, ret, done);
+ 	SNAPSHOT_VAR_OR_LEAVE(pi->pi_msi.msg_data, meta, ret, done);
+@@ -2535,6 +2554,13 @@
+ 				      meta, ret, done);
+ 	}
+ 
++	if (meta->op == VM_SNAPSHOT_RESTORE) {
++		/* Register the restored BARs whose decoding is enabled. */
++		cmd = pci_get_cfgdata16(pi, PCIR_COMMAND);
++		pci_emul_cmd_changed(pi,
++		    cmd & ~(PCIM_CMD_PORTEN | PCIM_CMD_MEMEN));
++	}
++
+ done:
+ 	return (ret);
+ }
