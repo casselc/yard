@@ -1,0 +1,45 @@
+# /etc/pf.conf -- yard N0 base ruleset (rendered by ops/n0-50-pf.sh; edit the template, not this file).
+# Posture: tailscale0 and lo0 are not filtered at all (Tailscale SSH and tailnet services keep working
+# whatever this file says). On the LAN interface only SSH from the local network, Tailscale's direct
+# UDP port, ICMP and IPv6 neighbour discovery come in; everything outbound is allowed and stateful.
+# Jail and VM networks (10.77.0.0/16 jails, 10.78.0.0/16 VMs) are default-deny; yard-ctl/yard-spawn
+# add their policy at runtime under the anchors "yard/*".
+
+ext_if = "@EXT_IF@"
+ts_port = "@TS_PORT@"
+yard_nets = "{ 10.77.0.0/16, 10.78.0.0/16 }"
+
+set skip on { lo0, tailscale0 }
+set block-policy drop
+set loginterface $ext_if
+set limit states 50000
+
+scrub in on $ext_if all fragment reassemble
+
+# --- translation: jail/VM egress leaves via the LAN address; per-sandbox rdr (metadata -> broker)
+nat on $ext_if inet from $yard_nets to any -> ($ext_if:0)
+nat-anchor "yard/*"
+rdr-anchor "yard/*"
+
+# --- filter
+block log all
+
+# host egress (stateful)
+# `flags any` so outbound TCP that was already open when pf loaded (e.g. tailscaled DERP or control
+# connections) gets state mid-stream instead of hitting `block log all` and being reset.
+pass out quick on $ext_if all flags any keep state
+
+# SSH from the LAN this interface is on. `flags any` + sloppy so an SSH session that was already open
+# over the LAN when pf was enabled keeps working.
+pass in quick on $ext_if proto tcp from ($ext_if:network) to ($ext_if) port ssh flags any keep state (sloppy)
+
+# Tailscale direct (peer-to-peer) WireGuard UDP; without it Tailscale falls back to DERP relays.
+pass in quick on $ext_if proto udp to ($ext_if) port $ts_port keep state
+
+# DHCP replies (dhclient reads them via bpf anyway) and ICMP
+pass in quick on $ext_if inet proto udp from any port 67 to any port 68
+pass in quick on $ext_if inet proto icmp icmp-type { echoreq, unreach, timex } keep state
+pass quick inet6 proto icmp6 all keep state
+
+# yard runtime policy: one anchor per sandbox/jail, e.g. yard/sbx-<id>, yard/jail-<name>
+anchor "yard/*"
