@@ -1,0 +1,20 @@
+{
+  "trust_domain": "home.arpa",
+  "halo_url": "http://127.0.0.1:8080",
+  "halo_hosts": ["inference.yard"],
+  "halo_secret": "halo",
+  "upstream_allow": ["api.anthropic.com:443", "api.openai.com:443"],
+  "providers": [
+    {"name": "anthropic", "hosts": ["anthropic.yard"], "upstream": "https://api.anthropic.com", "secret": "anthropic", "inject": "x-api-key"},
+    {"name": "openai", "hosts": ["openai.yard"], "upstream": "https://api.openai.com", "secret": "openai", "inject": "bearer"}
+  ],
+  "capture": "off",
+  "secrets_dir": "/var/lib/yard-broker/secrets",
+  "registry_file": "/var/lib/yard-broker/registry.json",
+  "floors_file": "/var/lib/yard-broker/state/floors.json",
+  "audit_file": "/var/lib/yard-broker/logs/audit.jsonl",
+  "spans_file": "/var/lib/yard-broker/logs/spans.jsonl",
+  "metrics_file": "/var/lib/yard-broker/logs/metrics.prom",
+  "sync_interval": "5s",
+  "minter": "none"
+}
