@@ -1,0 +1,175 @@
+vmm: restore the APICv guest interrupt status (RVI/SVI) and posted interrupts across a snapshot
+
+Against FreeBSD stable/15 fabb224f2f15 (independent of 0001-0003: sys/amd64/vmm/intel/vmx.c and
+sys/amd64/vmm/io/vlapic*; applies with patch -p1). This is the kernel module (vmm.ko), not bhyve.
+
+With virtual interrupt delivery (APICv; hw.vmm.vmx.cap.virtual_interrupt_delivery=1) the processor
+keeps the IRR/ISR of the guest's local APIC in the virtual-APIC page (vlapic->apic_page, saved by
+vlapic_snapshot()) but tracks the highest requested and in-service vectors in the VMCS guest
+interrupt status (RVI bits 7:0, SVI bits 15:8; VMCS_GUEST_INTR_STATUS), and interrupts posted while
+the vCPU is outside the guest sit in the posted-interrupt descriptor until vmx_inject_pir() moves
+them into the IRR on the next VM entry. vmx_vcpu_snapshot() saves neither, and a restored VM starts
+with a fresh VMCS (guest interrupt status 0) and an empty descriptor. So:
+- an interrupt posted but not yet injected at suspend time is lost;
+- an interrupt in service at suspend time leaves its ISR bit set in the restored page with SVI = 0.
+  The guest's EOI is virtualized against SVI: it clears the wrong ISR bit, the in-service vector stays
+  set for good (masking its priority class), and when the vCPU next halts, vm_handle_hlt() ->
+  vlapic_pending_intr() -> vlapic_update_ppr() finds an ISR bit with no isrvec_stk entry (under
+  virtual interrupt delivery isrvec_stk is never pushed) and panics the host:
+  "ISR and isrvec_stk out of sync" (vlapic.c:543).
+An idle guest (no interrupt in service, nothing posted) restores fine, which is why plain
+suspend/resume cycles pass; a guest suspended while busy with interrupts panics the host on restore.
+
+Fix: two vlapic ops, set by vmx only with virtual interrupt delivery and only under BHYVE_SNAPSHOT,
+called from vlapic_snapshot() per vCPU:
+- snapshot_save_sync, before the page is saved: vmx_inject_pir() under VMPTRLD/VMCLEAR -- the same
+  transfer (PIR -> IRR, raise RVI) the next VM entry would do, so a live checkpoint stays correct;
+- snapshot_restore_sync, after the page is restored: recompute RVI and SVI from the restored IRR and
+  ISR and write VMCS_GUEST_INTR_STATUS.
+Both run with every vCPU frozen (VM_SNAPSHOT_REQ is a VMMDEV_IOCTL_LOCK_ALL_VCPUS ioctl; same
+precondition and VMPTRLD/VMCLEAR pattern as vmx_set_tmr()). Recomputing rather than saving a new field
+keeps existing snapshots restorable. SVM and VMX without virtual interrupt delivery are unchanged.
+
+diff -ru a/sys/amd64/vmm/intel/vmx.c b/sys/amd64/vmm/intel/vmx.c
+--- a/sys/amd64/vmm/intel/vmx.c	2026-10-07 11:54:36.441676751 -0700
++++ b/sys/amd64/vmm/intel/vmx.c	2026-10-07 11:54:44.285088240 -0700
+@@ -4089,6 +4089,80 @@
+ 	}
+ }
+ 
++#ifdef BHYVE_SNAPSHOT
++/*
++ * Before the APIC page is saved: move posted interrupts from the PIR
++ * descriptor into the IRR and raise RVI, exactly as vmx_inject_pir() does
++ * on the next VM entry.  The descriptor is not part of the snapshot, so
++ * without this an interrupt posted while the vCPU was out of the guest is
++ * lost.  The vCPU is frozen and its VMCS is not current on any CPU.
++ */
++static void
++vmx_snapshot_save_sync(struct vlapic *vlapic)
++{
++	struct vlapic_vtx *vlapic_vtx;
++	struct vmcs *vmcs;
++
++	KASSERT(!vcpu_is_running(vlapic->vcpu, NULL),
++	    ("%s: vcpu cannot be running", __func__));
++
++	vlapic_vtx = (struct vlapic_vtx *)vlapic;
++	vmcs = vlapic_vtx->vcpu->vmcs;
++
++	VMPTRLD(vmcs);
++	vmx_inject_pir(vlapic);
++	VMCLEAR(vmcs);
++}
++
++static int
++vmx_highest_vector(uint32_t *regs)
++{
++	int i, bitpos;
++
++	/* IRR/ISR: eight 32-bit registers, 16 bytes apart */
++	for (i = 7; i >= 0; i--) {
++		bitpos = fls(regs[i * 4]);
++		if (bitpos != 0)
++			return (i * 32 + bitpos - 1);
++	}
++	return (0);
++}
++
++/*
++ * After the APIC page is restored: the restored VM has a fresh VMCS whose
++ * guest interrupt status (RVI in bits 7:0, SVI in bits 15:8) is 0.  With an
++ * interrupt in service at save time, SVI = 0 makes the guest's virtualized
++ * EOI clear the wrong ISR bit: the in-service vector stays set forever,
++ * masking its priority class, and the software check in
++ * vlapic_update_ppr() (reached from vm_handle_hlt()) panics the host with
++ * "ISR and isrvec_stk out of sync".  Rebuild both from the restored page.
++ */
++static void
++vmx_snapshot_restore_sync(struct vlapic *vlapic)
++{
++	struct vlapic_vtx *vlapic_vtx;
++	struct vmcs *vmcs;
++	struct LAPIC *lapic;
++	int rvi, svi;
++
++	KASSERT(!vcpu_is_running(vlapic->vcpu, NULL),
++	    ("%s: vcpu cannot be running", __func__));
++
++	vlapic_vtx = (struct vlapic_vtx *)vlapic;
++	vmcs = vlapic_vtx->vcpu->vmcs;
++	lapic = vlapic->apic_page;
++
++	rvi = vmx_highest_vector(&lapic->irr0);
++	svi = vmx_highest_vector(&lapic->isr0);
++
++	VMPTRLD(vmcs);
++	vmcs_write(VMCS_GUEST_INTR_STATUS, (svi << 8) | rvi);
++	VMCLEAR(vmcs);
++	VLAPIC_CTR2(vlapic, "vmx_snapshot_restore_sync: rvi %d svi %d",
++	    rvi, svi);
++}
++#endif
++
+ static struct vlapic *
+ vmx_vlapic_init(void *vcpui)
+ {
+@@ -4120,6 +4194,10 @@
+ 		vlapic->ops.intr_accepted = vmx_intr_accepted;
+ 		vlapic->ops.set_tmr = vmx_set_tmr;
+ 		vlapic->ops.enable_x2apic_mode = vmx_enable_x2apic_mode_vid;
++#ifdef BHYVE_SNAPSHOT
++		vlapic->ops.snapshot_save_sync = vmx_snapshot_save_sync;
++		vlapic->ops.snapshot_restore_sync = vmx_snapshot_restore_sync;
++#endif
+ 	}
+ 
+ 	if (posted_interrupts)
+diff -ru a/sys/amd64/vmm/io/vlapic.c b/sys/amd64/vmm/io/vlapic.c
+--- a/sys/amd64/vmm/io/vlapic.c	2026-10-07 11:54:36.448791921 -0700
++++ b/sys/amd64/vmm/io/vlapic.c	2026-10-07 11:54:36.467664457 -0700
+@@ -1858,6 +1858,15 @@
+ 
+ 		/* snapshot the page first; timer period depends on icr_timer */
+ 		lapic = vlapic->apic_page;
++		/*
++		 * With virtual interrupt delivery, interrupts posted but not
++		 * yet moved into the IRR live in the posted-interrupt
++		 * descriptor, which is not saved: move them into the page
++		 * (as the next VM entry would) before it is saved.
++		 */
++		if (meta->op == VM_SNAPSHOT_SAVE &&
++		    vlapic->ops.snapshot_save_sync != NULL)
++			(*vlapic->ops.snapshot_save_sync)(vlapic);
+ 		SNAPSHOT_BUF_OR_LEAVE(lapic, PAGE_SIZE, meta, ret, done);
+ 
+ 		SNAPSHOT_VAR_OR_LEAVE(vlapic->esr_pending, meta, ret, done);
+@@ -1900,6 +1909,15 @@
+ 			 */
+ 			vlapic_reset_callout(vlapic, ccr);
+ 		}
++
++		/*
++		 * With virtual interrupt delivery the processor tracks the
++		 * highest requested and in-service vectors (RVI/SVI) outside
++		 * the page; rebuild them from the restored IRR/ISR.
++		 */
++		if (meta->op == VM_SNAPSHOT_RESTORE &&
++		    vlapic->ops.snapshot_restore_sync != NULL)
++			(*vlapic->ops.snapshot_restore_sync)(vlapic);
+ 	}
+ 
+ done:
+diff -ru a/sys/amd64/vmm/io/vlapic_priv.h b/sys/amd64/vmm/io/vlapic_priv.h
+--- a/sys/amd64/vmm/io/vlapic_priv.h	2026-10-07 11:54:36.454335779 -0700
++++ b/sys/amd64/vmm/io/vlapic_priv.h	2026-10-07 11:54:36.467531186 -0700
+@@ -140,6 +140,9 @@
+ 	void (*post_intr)(struct vlapic *vlapic, int hostcpu);
+ 	void (*set_tmr)(struct vlapic *vlapic, int vector, bool level);
+ 	void (*enable_x2apic_mode)(struct vlapic *vlapic);
++	/* BHYVE_SNAPSHOT: hardware-held interrupt state around the APIC page */
++	void (*snapshot_save_sync)(struct vlapic *vlapic);
++	void (*snapshot_restore_sync)(struct vlapic *vlapic);
+ };
+ 
+ struct vlapic {

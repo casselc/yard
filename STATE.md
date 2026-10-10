@@ -1,0 +1,275 @@
+# yard Phase 1 (stream Y): durable state
+
+Resume from here. Design docs: /work/research/agent-platform/{CONTROL-PLANE,HARNESS,IDENTITY}.md.
+Build/deploy: `. ./env.sh` (Halo), `tools/deploy-nuc.sh` (builds FreeBSD binaries + test binaries, copies them,
+ops/ and the shim source to the NUC ~/yard as chuck, compiles the shim there with cc).
+
+## Status (2026-10-07)
+- [x] repo, module `yard`; internal/sts + internal/tpmkey copied from nuc/src/signer (thread-locked TPM transport)
+- [x] N0 root scripts in ops/ (mirrored to NUC ~/yard/ops): n0-10-zfs, n0-20-audit, n0-30-tasks,
+      n0-40-template, n0-50-pf (+ -undo for each, yard-unlock.sh). NOT RUN: waiting on the user.
+- [x] yard-ctl: internal/{keyring,issuer,jwks,frontend,ctl}, cmd/yard-ctl. Unit tests pass on Linux (-race)
+      and on the NUC (FreeBSD peercred path). Soft-key smoke on the NUC as chuck: init/serve/mint/verify/
+      rotate/auto-retire all worked (50 CLI mints in 0.47 s incl. process start).
+- [x] yard-spawn J0: internal/{jail,rctl,mount,pfanchor,spawn}, cmd/yard-spawn, shim/yard-exec-shim.c
+      (builds -Werror on the NUC). Unit tests (fake Sys) pass on Linux and the NUC.
+- [x] user ran N0 scripts 1-8 (2026-10-07): all OK; pf persistent (n0-50 confirm 13:44Z); final t20 rc=0 13:51Z
+- [x] logs read, predicted-vs-actual below; three defects found by the runs and fixed:
+  - n0-20-audit (0e1427d): auditd keeps `current` at the fixed /var/audit/current (OpenBSM
+    AUDIT_CURRENT_LINK), not under dir:; the check now reads it, falling back to the newest open trail.
+  - rctl (7568ba2): the kernel parses rule amounts with strtoul (kern_rctl.c str2int64) and rejects
+    k/m/g suffixes with EINVAL; rctl(8) expands them in userland. We now expand to digits (powers of
+    1024) before rctl_add_rule. t20 now stops if task-begin yields no uid.
+  - anchor flush (402e041): `pfctl -a <anchor> -F all` fails with ENODEV on 15.1-STABLE before
+    flushing anything (it flushes the anchor's eth rules and tables first); now an empty load
+    (`-f /dev/null`). t20's fake broker runs in its own process group (an orphaned `nc` loop held the
+    log pipe and hung the wrapper); t20 G checks the anchor is empty after destroy.
+
+## Root run order (user: `cd ~/yard/ops && sudo sh <script>`)
+1. n0-10-zfs.sh        (passphrase prompt twice)
+2. n0-20-audit.sh
+3. n0-30-tasks.sh
+4. n0-40-template.sh   (network: pkg.FreeBSD.org)
+5. tests/t10-ctl-tpm.sh
+6. tests/t20-spawn-j0.sh   (F audit runs; G broker SKIPs until pf)
+7. n0-50-pf.sh apply 5  -> new ssh session -> n0-50-pf.sh confirm
+8. tests/t20-spawn-j0.sh   again (G broker check now runs)
+
+## Predictions (stated before any run)
+- t10: prod keys sign p50 19-21 ms; scratch init 3-6 s; retire 1.5-3 s; handle set unchanged.
+- t20 H: per-call total p50 ~2.0 ms (1.5-3.5), p99 < 6 ms; +0.1 ms with -mem.
+- t20 C: timeout exit 124 after 2.0-2.5 s; 0 leftover processes/dying jails.
+- n0-50: 7 filter rules + anchor; existing SSH survives; 80% some blocked LAN noise within minutes.
+
+## Actual (2026-10-07)
+- t10: sign p50 19.62 ms (max 19.88, n=10); scratch init 1.95 s (predicted 3-6, faster); retire 1.15 s
+  (predicted 1.5-3, faster); rotation cycle PASS.
+- t20 H: total p50 2.46-2.52 ms, p99 3.5-4.0 ms (in range); 360-400 calls/s; -mem adds ~0.1-0.2 ms setup.
+- t20 C: exit 124 after 2.02 s; 0 leftover processes, 0 dying jails.
+- t20 D/E/F/G: 100M denied under a 64M call rule; user: accounting maxproc=51 across child jails;
+  7 audit records carry zone ysbx_j0a.caud1; metadata rdr to the broker works for IMDS and ECS,
+  internet and host sshd blocked, net=none child has no network, anchor empty after destroy.
+- n0-50: existing SSH survived; persistent after confirm.
+
+## NUC facts (read-only inspection, 2026-10-07)
+- 15.1-STABLE n285848; LAN igc0 192.168.1.72/22 (DHCP), gw 192.168.1.1; tailscale0 100.64.0.10.
+- pf not loaded, no /etc/pf.conf. auditd not enabled. kern.racct.enable=1. securelevel -1.
+- zroot/yard-p0 destroyed by 99-cleanup (no template left). TPM keys kept at 0x81010010/11.
+- /dev/tpm0 root:wheel 0600; chuck cannot open it, so TPM tests run as root.
+- User jails: zroot/jails/* (ubuntu-noble on igc0 alias 192.168.2.242, not running). Do not touch.
+- zroot/home/user already uses keyformat=passphrase keylocation=prompt (precedent for zroot/yard/data).
+- linux64 is loaded on the host (linux_enable=YES), contrary to the "linux64 off" decision for the jailhost VM.
+
+## Forward compatibility (lead, 2026-10-07; HARNESS.md "Milestones: suspend and resume", NOT in scope)
+- SR1: long-running jails must be expressible as a service spec (command, env, cwd, ports, readiness probe).
+  Today spawn.Call already carries argv/env/cwd/net/limits and spawn.Sandbox persists as versionable JSON
+  (sandbox.json); a ServiceSpec = Call fields + ports + probe, with a Start/Stop path beside the synchronous
+  Run (which requires a timeout). Nothing built here blocks that.
+- SR0: yard-ctl has no session store yet (only keyring.json with "version" and the hash-chained mint log).
+  The session table, when added, needs a lifecycle state field and a one-shot resume token consumed atomically
+  (SQLite). Keep the mint log separate from it.
+
+## SR0: session suspend/resume lifecycle (branch sr0, 2026-10-07)
+Design + code only; nothing run on the NUC. Spec: spec/sr0/README.md (scope, assumptions, register of
+external calls, mutant results, Quint -> Go mapping, what SR1-SR5 must provide).
+- [x] Quint model spec/sr0/lifecycle.qnt (quint 0.32; typecheck/run/test, no verify): states active, idle,
+      suspending, suspended, resuming, expired, failed; suspend record (kind, checkpoint/artifact, ZFS
+      snapshot, token, credential epoch); every external call (quiesce, checkpoint, destroy, unquiesce,
+      restore, STS mint, artifact delete) is request/effect/answer with lost request, late effect, lost
+      answer, duplicate (retry, replay after restart), per casselc/observability otel-chdb/model/TEMPLATE.md;
+      clock, op timeouts, slow activity observation, yard-ctl crash/restart at any step.
+- [x] Invariants I1-I7 (resumed at most once, no acked write lost, no pre-suspend credential, artifacts
+      encrypted and accounted, resume keeps its artifact, suspend only when idle, no held message dropped).
+      Design and design2 hold at seed 0x5eed (3000 samples x 100 steps); 12 mutants each break their
+      invariant, 7 in random simulation and all 12 in scripted counterexamples (lifecycle_test.qnt).
+- [x] internal/lifecycle: pure Ctl (one method per Quint action), SQLite Store (modernc.org/sqlite v1.46.1,
+      pure Go, builds for freebsd; token consume and expiry are single conditional UPDATEs, other commits
+      CAS on the row), Machine (executor, clock, facts, recovery on Start: CtlRestart, RecoverOps, Adopt),
+      Backend/Minter/ArtifactStore/ActivitySource/FactSink interfaces (SR1-SR4 implement).
+- [x] Tests: 18 per-transition unit tests, 10 Machine/Store tests (double-resume race 32 callers -> 1 winner;
+      16 store handles + an expiry on one token -> 1 winner; restart mid-resume; checkpoint timeout landing
+      late; activity abort; message wake; expiry; unencrypted dataset refused), ITF replay of 189 traces
+      (spec/sr0/gen_traces.sh) comparing Go to the model after every step; -race clean.
+- Module: modernc.org/sqlite and deps came from the shared module cache under platform/go/cache/mod via
+  GOPROXY=file://...; GOSUMDB was off for that one `go get` (go.sum hashes are the cached zips').
+- Open: Deliver (message payload to the harness) is atomic in the model; instance loss while Active is not
+  detected (SR1/SR2 health); a per-unknown-class production counter (AMBIGUITY rule 5); the broker and STS
+  must enforce the epoch (I3); one yard-ctl process per database (A3).
+- Decisions 2026-10-07 (user accepted the lead's recommendations; spec/sr0/README.md "Decisions"):
+  - go.sum: the lead verifies online.
+  - Message queue: yard-ctl owns it beside the lifecycle store. SR5 modelling item: delivery becomes
+    request/effect/answer (message ids, harness dedupe, remove only on Done).
+  - Credential epoch: implemented in internal/issuer (yard_sess/yard_epoch claims; mint refused unless
+    current; VerifyEpoch for the broker side). Machine implements issuer.EpochSource.
+  - One yard-ctl per database: lifecycle.OpenOwned (flock on <db>.lock, fail fast with ErrOwned).
+  - SR1/SR2 requirement: health checks detect a dead instance while Active; model it first.
+  - Metrics: lifecycle.OutcomeCounter hook on the fact sink; export as OTel counters when backends are real.
+  - Focused simulation instances for the 5 mutants plain random runs missed (spec/sr0 README table).
+
+## SR3 spike: bhyve snapshot/restore (branch sr3, 2026-10-07) -- bhyveload GATE PASS; UEFI restore hang explained (bhyve bug, patch on sr3-uefi)
+- Source: NUC /usr/src = pkgbase FreeBSD-src 15.snap20261006235134, same snapshot as the running
+  FreeBSD-kernel-generic; the 600 relevant files (sys/amd64/vmm, sys/dev/vmm, sys/modules/vmm, sys/conf,
+  sys/amd64/include, share/mk, usr.sbin/bhyve{,ctl}, lib/libvmmapi) are byte-identical to git fabb224f2f15
+  (= `uname -v`). No separate checkout needed.
+- Build (ops/sr3/sr3-00-build.sh, as chuck, ~9 s total): config(8) on "include GENERIC + options
+  BHYVE_SNAPSHOT" for the opt_*.h only, vmm.ko tied to it (KERNBUILDDIR) -> vmm_snapshot.c included;
+  libvmmapi.a static (-fPIE); bhyve/bhyvectl WITH_BHYVE_SNAPSHOT=yes linked to it. Checks pass:
+  vm_snapshot_req/vm_restore_time in vmm.ko, --checkpoint/--suspend in bhyvectl, -r in bhyve, no
+  libvmmapi.so dependency, all 233 undefined module symbols exported by the running kernel.
+  Gotchas: CFLAGS/LDFLAGS on the make command line replace the Makefiles' CFLAGS+= (pass via env);
+  libvmmapi.so fails to link with -fPIE (TLS relocs) -> build only the libvmmapi.a target.
+- Source facts: bhyvectl --suspend/--checkpoint only delivers the request over /var/run/bhyve/<vm>
+  (answer != effect); with suspend bhyve writes .ckp/.kern/.meta then vm_destroy + exit(5). A device
+  without pe_snapshot (virtio-console, virtio-9p, virtio-scsi, nvme, hda, passthru, virtio-input) makes
+  the checkpoint fail with ENOTSUP AFTER the full memory write, and the VM resumes. virtio-console is
+  the planned runner transport (CONTROL-PLANE §5) -> probe in sr3-30.
+- Root run order (user, `cd ~/yard/ops/sr3 && sudo sh <script>`): sr3-10-install.sh, sr3-20-vmm.sh,
+  sr3-30-cycles.sh. Undo: sr3-30-cycles-undo.sh, sr3-20-vmm-undo.sh (or reboot), sr3-10-install-undo.sh.
+- Predictions (before any run): .ckp = guest RAM exactly (2,684,354,560 B for 2560M), 0.2-0.7 GB
+  allocated on lz4; .kern 20-200 KB; .meta 5-30 KB. Suspend req->answer < 50 ms, answer->exit 2.0 s (1-5).
+  Restore start->first tick 1.5 s (0.7-4). Live checkpoint pause ~2 s (1-5). 50/50 done, state intact,
+  0 hangs (70%). virtio-console probe: answer ok, effect notdone, VM keeps running. Guest clock skew
+  after restore -5..+1 s.
+- First runs (user, 2026-10-07, 143348Z N=5 and 143825Z N=50 stopped after 6 recoveries): install and
+  vmm swap OK. Suspend: 11/11 done, proc rc 5, req->answer 4 ms, answer->exit 1.28 s (predicted 2.0,
+  1-5); .ckp 2,684,354,560 B = guest RAM as predicted, but only ~38-45 MB allocated (predicted 0.2-0.7 GB;
+  lz4 on mostly-zero pages, compressratio 8.8x); .kern 88,025 B, .meta 1,384 B (below the predicted
+  5-30 KB). Live checkpoint 7/7 done, 0.86-1.33 s. virtio-console probe: answer ok, effect notdone, as
+  predicted. Restore: 11/11 notdone in 24 ms -- defect in sr3-30: "bhyve: no bootrom was configured"
+  (without a bootrom bhyve only opens a VM bhyveload created; the suspend destroyed it). Fixed: the VM is
+  recreated with bhyveload before `bhyve -r` (timed separately); optional SR3_BOOT=uefi. Cold boot to
+  first tick is 17 s, not 4 s: every cold boot rolls back to @prepared, so firstboot runs each time.
+- Run 2 (user, 145239Z bhyveload N=50; 150153Z uefi): bhyveload suspend 50/50 + restore 50/50 done,
+  state intact (tok/pid/counter/disk/log), 0 hangs; suspend p50 0.78 s, restore = bhyveload 0.136 s +
+  start->first tick 1.43 s. Three TEST defects (fixed in sr3-30): net=FAIL 50/50 because tunclose()
+  purges the tap's host address when bhyve exits; skew -14401 s from the localtime RTC (no -u; host is
+  UTC-4); after the recovery limit the hung VM was left running and the live checkpoints ran on it.
+  Real finding: guest time does not advance across the downtime (vm_restore_time re-bases the TSC),
+  -1.35 s per cycle -> a resumed guest needs a clock step (as SR2 plans). UEFI: 6/6 suspends done, 6/6
+  restores hang (bhyve alive, no tick, no stderr). The snapshot saves only lowmem+highmem
+  (vm_get_guestmem_from_ctx); the VM_BOOTROM devmem segment and the CFI flash variable state
+  (bootrom.c `var`) have no snapshot hook -- suspected cause, unconfirmed; the rerun captures vCPU
+  RIP/CR0 on hang.
+- Rerun predictions: bhyveload GATE PASS, net ok 50/50 (and after every cold boot), cold-boot skew 0..-1 s,
+  skew vs boot ~-1.35 s per restore (about -68 s by cycle 50). uefi: restores still hang (75%); the RIP
+  samples either do not move (vCPU stuck/halted) or sit in the firmware's runtime region.
+- Run 3 (user, 2026-10-07): bhyveload 154337Z N=50: GATE PASS. Suspend 50/50 (total p50 0.784 s),
+  restore 50/50 (bhyveload 0.136 + start->first tick 1.384 = p50 1.521 s, max 1.583), live 5/5 (p50
+  0.72 s), state intact incl. net 50/50 and at both cold boots, 0 unknown, 0 cap hits, ckp allocated
+  43.5-52.5 MB of 2.5 GB (compressratio 8.11x). Skew: cold boot -1 s, then -1.35 s per restore (-67 s
+  after 50), as predicted. uefi 155438Z N=3: GATE FAIL, 3/3 restores hang. Diagnostics contradict the
+  firmware-memory hypothesis: both vCPUs run in the guest KERNEL (RIP 0xffffffff81..., changing between
+  samples, not halted) with RFLAGS 0x46 (IF=0): the kernel resumed and spins with interrupts off,
+  likely waiting for an interrupt/IPI that never arrives. Leading hypothesis (unconfirmed): x2APIC mode
+  under UEFI vs xAPIC under bhyveload, with x2APIC state not restored. Decision: suspend/resume uses
+  bhyveload FreeBSD guests; UEFI/Linux guests are cold-boot-only until this is explained.
+- UEFI hang analysis (branch sr3-uefi, 2026-10-07, source + logs only, no new run yet):
+  * Symbols (15.1-RELEASE kernel.txz, the guest's kernel: console shows releng/15.1-n283562-96841ea08dcf):
+    8115fdb8/8115fde6 = lapic_et_start just after the xAPIC MMIO writes of LVT-timer/initial-count,
+    8105acfa = cpu_idle_acpi right after `sti; hlt`, 81070120 = Xtimerint_pti, 80b983dc = binuptime,
+    80b99d86 = tc_ticktock. Not a spin: both vCPUs idle in hlt and take LAPIC timer interrupts (582 in
+    60 s, idle ticks ~60k). The kernel is alive; every thread is blocked. No x2APIC in this guest
+    (Features2 has no x2APIC, x2apic_mode=0 paths taken), so the x2APIC hypothesis is out.
+  * Boot-log diff bhyveload vs UEFI: the firmware reassigns the virtio MMIO BARs (blk 0xc0000000 ->
+    0xc0002000, net the reverse), INTx 16/17 -> 23/16 (fixed bootrom mapping in ioapic.c), efirtc0, ACPI
+    from the firmware's copy. I/O BARs 0x2000/0x2080 identical.
+  * Root cause (bhyve, unfixed on main as of b27a221ef79d): with a boot ROM, pci.enable_bars defaults to
+    false (e962b37bf0ff), so bhyve registers no BAR handlers at startup and the firmware's command-register
+    write registers them. On restore pci_snapshot_pci_dev() (pci_emul.c) copies pi_bar[].addr and the
+    whole config space (decode bits set) but never calls register_bar: the restored guest has NO I/O or
+    MMIO handlers for any PCI device. virtio-blk queue notifies go to the default inout handler and are
+    dropped -> the agent's write/fsync never completes -> no SR3TICK, ever (consistent with only 17
+    in/out exits in 60 s). bhyveload works only because bhyve's own BAR assignment is registered at
+    startup and the guest never moved it.
+  * Latent, same mechanism: without a boot ROM a guest that moved a BAR also resumes with handlers at
+    the old address. Also: bhyve_init_platform_late() rewrites mptable/SMBIOS/ACPI into guest RAM AFTER
+    restore_vm_mem (deterministic content in a reserved range: harmless here).
+  * vmgenc (coordinator question): present in BOTH boot modes (acpi_tables defaults to true on amd64;
+    both boot logs show vmgenc0), so not UEFI-specific and not the cause. Its UUID page is bootrom_alloc'd
+    in the bootrom devmem segment, outside lowmem/highmem, so it is NOT in the snapshot: restore's
+    vmgenc_init writes a NEW random UUID, but the GPE that would notify the guest is `#if 0` ("XXX When
+    we have suspend/resume/rollback"), so the guest never re-reads it and does not reseed. Consequence
+    for yard: a restored guest (and every clone of one snapshot) keeps its pre-snapshot RNG state ->
+    SR2 resume must reseed explicitly (write fresh entropy to /dev/random in the guest) or we patch
+    bhyve to raise GPE_VMGENC after restore (guest vmgenc_notify -> random_harvest_direct reseed).
+  * Patch: ops/sr3/patches/0001-bhyve-snapshot-restore-reregisters-pci-bars.diff (userland bhyve only,
+    syntax-checked with the NUC's cc -Wall -Werror): on restore, clear the decode bits and let
+    pci_emul_cmd_changed() unregister the pre-restore BARs, read the state, then let it register the
+    restored BARs whose decoding is enabled. Build: sr3-00-build.sh SR3_PATCHES/SR3_VARIANT (shadow
+    source tree, /usr/src untouched), installed beside the base build as bhyve-snap-<variant>.
+  * No-build workaround (diagnostic only): `bhyve -r ... -o pci.enable_bars=true` registers bhyve's
+    default BARs; correct for the I/O BARs here, but the MSI-X MMIO handlers then sit at the swapped
+    addresses (a guest MSI-X table access would hit the wrong device / assert). Not for production.
+  * Experiments and predictions (stated before the runs): A (unpatched, SR3_BOOT=uefi N=3,
+    SR3_RESTORE_OPTS="-o pci.enable_bars=true"): 3/3 restores done, state intact (80%). B (negative
+    control, unpatched, bhyveload N=3, "-o pci.enable_bars=false"): 3/3 restores hang like UEFI, same
+    idle/timer RIPs (85%). C (SR3_VARIANT=p1, uefi N=50): GATE PASS, restore start->first tick ~1.4 s as
+    bhyveload (75%). D (p1, bhyveload N=50): GATE PASS, no regression (90%). E (p1, bhyveload N=3 with
+    "-o pci.enable_bars=false"): 3/3 done (85%). If A and B come out as predicted but C fails, the
+    patch is wrong, not the diagnosis.
+  * Upstream: report warranted (draft in ops/sr3/patches/UPSTREAM-PR-draft.txt, not filed).
+- VM generation ID on restore (user approved the patch, 2026-10-07; patch 0002, variant p2 = 0001+0002):
+  * Source facts: amd64/pm.c (PM1 enable/status/control, GPE0 enable/status, sci_active) has NO
+    snapshot hook -> after restore GPE0_EN=0, so raising the vmgenc GPE alone would never reach the
+    guest; and the SIGTERM power-button mevent (installed on the guest's ACPI-enable write) is missing,
+    so `kill -TERM` does not power a restored guest off (stop path for yard: bhyvectl/kill -9 or p2).
+    The SCI pin itself (vatpic ELCR, vioapic rtbl+acnt) IS in the kernel snapshot.
+  * 0002: pm_snapshot() as device "pm" (restore tolerates older snapshots without it; re-installs the
+    power-button handler when SCI_EN was set); vmgenc_restore() runs in bhyverun.c after
+    vm_restore_devices/vm_restore_kern_structs/vm_resume_devices and before vm_resume_cpu: fresh ID
+    into the page + acpi_raise_gpe(GPE_VMGENC). Not called by --checkpoint (running VM keeps its ID).
+    Syntax-checked on the NUC (cc -Wall; only the two pre-existing snapshot.c -Wpointer-sign hits).
+  * Guest side: FreeBSD vmgenc(4) on notify 0x80 compares the page with its cache, then
+    random_harvest_direct(RANDOM_PURE_VMGENID) into Fortuna pool 0 (reseed at the next /dev/random read
+    once pool 0 has >= 64 B and >= 100 ms since the last reseed -- not a forced immediate reseed),
+    EVENTHANDLER acpi_vmgenc_event (no in-tree listener), devd ACPI/VMGenerationCounter; no counter,
+    but sysctl dev.vmgenc.0.guid shows the cached ID. Userland arc4random state in long-lived processes
+    is NOT reseeded on FreeBSD (no userland hook). Linux vmgenid (ACPI ids VMGENCTR/VM_GEN_COUNTER, ADDR
+    package, notify 0x80) -> add_vmfork_randomness(): immediate crng reseed + vDSO getrandom generation
+    bump + uevent NEW_VMGENID=1; bhyve's _CID "VM_Gen_Counter" evidently matches FreeBSD's uppercase id,
+    the same match should hold for Linux -- verify with the first Linux guest.
+  * sr3-30: agent v2 (@prepared2; first run re-prepares the image, ~2 min) prints gen/kr/vg; after each
+    restore gen=chg|same and vgev=+n are recorded; SR3_SAME_SNAP=yes restores one snapshot SR3_SAME_K
+    times (disk rolled back to @same each time) and records pwr=off|killed for SIGTERM. Gate items only
+    with SR3_VARIANT=p2+.
+  * Predictions: unpatched (A-D runs): gen=same, vgev=+0 on every restore (95%); unpatched same-snap:
+    pwr=killed every time (90%), kr distinct anyway (60%: host RDSEED/interrupt entropy reaches pool 0
+    before the agent's first read), so kr alone does not discriminate. p2 uefi N=50 and bhyveload
+    N=50: GATE PASS with gen=chg vgev=+1 on all 50 (80%). p2 same-snap K=5: 5/5 done, 5 distinct gen,
+    5 distinct kr, pwr=off 5/5 (75%).
+- Runs 2026-10-07 (A/B/p1/p2) and the vmm bug they exposed (patch 0003, variant p3 = 0001+0002+0003):
+  * A (uefi, -o pci.enable_bars=true) 3/3 PASS; B (bhyveload, =false) 3/3 hang as predicted; p1
+    bhyveload 50/50 PASS; p1 uefi 50/50 done but 2 "corrupt" = harness defect (half-written console line
+    parsed; fixed in sr3-30, RUN 5). p2: only the first restore after a cold boot gets the vmgen notify,
+    and a restored guest never powers off on SIGTERM.
+  * Cause (source-checked): APICv EOI virtualization. The VMCS EOI-exit bitmap is set only by
+    vioapic_update_tmr() on a guest redirection-table write; a restored VM starts with it zeroed and
+    nothing rebuilds it, so the guest's EOI of the level SCI never reaches the vioapic (Remote IRR stays
+    1, pin wedged; later snapshots carry RIRR=1). 0003 (vmm.ko) rebuilds it in vm_snapshot_req() after
+    the vioapic and vlapic restores. Old wedged snapshots stay wedged (disposable).
+  * Build/install: a variant with sys/ patches builds its own vmm.ko (BUILDINFO kmod=own); sr3-20-vmm.sh
+    with SR3_VARIANT loads it, sr3-30 refuses any other bhyve/vmm pairing. sr3-30 RUN 5 also fixes the
+    mid-run overwrite abort (whole body parsed up front, rename deploy, summary from the EXIT trap).
+  * Predictions for p3: uefi N=50 and bhyveload N=50 GATE PASS with gen=chg vgev>=1 on all 50 and
+    final_pwr=off (80%); same-snap K=5 pwr=off 5/5 (85%); p1 uefi false corruption gone (95%).
+    Control without the patch: p2 with kenv hw.vmm.vmx.use_apic_vid=0 behaves like p3 (75%).
+
+## SR3 host panic on restore under APICv (2026-10-07) -- patch 0004 written, untested
+
+- 14:41:51 EDT the NUC panicked: "ISR and isrvec_stk out of sync" (/var/crash/info.1, vmcore.1). It was 2 s
+  after the first restore in the SR3J e2e (sr3j-20-20261007T183613Z), of a guest that was busy (its UART
+  bulk test had stalled; it had stopped ticking) on the base snapshot vmm.ko with APICv on.
+- Cause (source): vmx_vcpu_snapshot() saves neither VMCS_GUEST_INTR_STATUS (RVI/SVI) nor the PIR
+  descriptor, so an in-service vector at suspend stays in service after restore (SVI = 0). The next HLT
+  reaches vlapic_update_ppr()'s always-on check (vlapic.c:543) via vm_handle_hlt() (vmm.c:779).
+  Every SR3 cycle so far suspended an idle guest, which is why the gate never saw it.
+- Patch 0004 (vmx.c, vlapic.c, vlapic_priv.h): flush PIR -> IRR before the save; recompute RVI/SVI from
+  IRR/ISR after the restore. Variant p4 = 0001-0004 (kmod=own). It applies cleanly; not yet compiled.
+- sr3-30-cycles.sh SR3_LOAD=irq: ping flood during each suspend. It refuses pre-p4 modules while virtual
+  interrupt delivery is on, unless SR3_LOAD_FORCE=yes. The run header and GATE line record VID and LOAD.
+- Standalone reproducer for the report: ops/sr3/repro/apicv-restore-panic.sh (REPRO_ACK=panic-the-host).
+- Predictions:
+  - p4 + SR3_LOAD=irq, N=50: GATE PASS, both boots.
+  - APICv off + base module + SR3_LOAD=irq: GATE PASS.
+  - p3 + SR3_LOAD_FORCE=yes: host panic, or guest wedge, within a few cycles.
+- Until p4 passes, never suspend a busy guest on base/p1-p3 with APICv on.
