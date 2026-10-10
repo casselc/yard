@@ -1,0 +1,106 @@
+vmm: rebuild the vlapic trigger-mode registers (VMCS EOI-exit bitmaps) after a snapshot restore
+
+Against FreeBSD stable/15 fabb224f2f15 plus 0001 and 0002 (independent files: sys/amd64/vmm only;
+applies with patch -p1). This is the kernel module (vmm.ko), not bhyve.
+
+With virtual interrupt delivery (APICv; hw.vmm.vmx.cap.virtual_interrupt_delivery=1) a guest EOI
+for a vector exits to vmm only if that vector's bit is set in the VMCS EOI-exit bitmap; vmx_set_tmr()
+keeps the bitmap equal to the vlapic TMR. The TMR is derived, never saved: vioapic_update_tmr()
+recomputes it from the redirection table, and only a guest write to a redirection entry calls it
+(vioapic_write() -> vm_smp_rendezvous()). A restored VM is a new VM (vmx_vcpu_init() writes
+EOI_EXIT0-3 = 0); vioapic_snapshot() restores rtbl[].reg/acnt and vlapic_snapshot() the APIC page
+(TMR bits included), but nothing reprograms the bitmap. So the restored guest's EOI for a
+level-triggered vector is completed in hardware, vioapic_process_eoi() never runs, Remote IRR stays
+set and the pin delivers nothing after its first interrupt. Seen with the ACPI SCI (IRQ 9, level):
+the first GPE after a restore (patch 0002's VM-generation notify) is delivered, every later one --
+the power button (SIGTERM), the next restore's notify -- is not; a snapshot taken from that guest
+carries RIRR=1, so all its descendants restore already wedged. Any level-triggered INTx device is
+affected the same way; virtio and ahci use MSI-X, so nothing else showed it here.
+
+Fix: vioapic_restore_tmr() runs vioapic_update_tmr() for every vCPU, and vm_snapshot_req() calls it
+after restoring STRUCT_VIOAPIC and after STRUCT_VLAPIC (bhyve restores vioapic, then vlapic; the
+second rebuild sees the restored APIC ID/LDR/DFR, and the result does not depend on the order).
+VM_SNAPSHOT_REQ is a VMMDEV_IOCTL_LOCK_ALL_VCPUS ioctl, one per kernel struct, so every vCPU is
+frozen (vmx_set_tmr() asserts it is not running) and bhyve has activated all vCPUs before it
+restores (vlapic_calcdest() only matches active vCPUs). Locking is that of the rendezvous path
+(vioapic spin lock, then VMPTRLD/VMCLEAR per vector). AMD SVM installs no set_tmr op (EOIs always
+trap to vlapic_process_eoi(), which reads the restored TMR from the APIC page), and neither does
+VMX without virtual interrupt delivery: there the change only rewrites the TMR in the APIC page
+with the value it already had.
+
+Not changed: a snapshot taken under an unfixed vmm.ko after the first level interrupt carries
+Remote IRR=1 for that pin with no EOI to come (the guest already sent it). Restore keeps that state,
+as a real IO-APIC clears Remote IRR only on an EOI; telling "EOI lost" from "guest still in its
+handler" would need the ISR/IRR of every vlapic and the posted-interrupt descriptors (not
+snapshotted), and a wrong guess injects a duplicate interrupt. Such snapshots stay wedged on that
+pin and must be retaken under the fixed module.
+
+--- a/sys/amd64/vmm/io/vioapic.c
++++ b/sys/amd64/vmm/io/vioapic.c
+@@ -543,4 +543,33 @@
+ done:
+ 	return (ret);
+ }
++
++/*
++ * Rebuild every vCPU's trigger-mode register from the restored redirection
++ * table.  At run time this happens only when the guest writes a redirection
++ * entry (vioapic_write() -> vioapic_update_tmr()), and a restored VM is a new
++ * VM: its vlapics and, with virtual interrupt delivery, its VMCS EOI-exit
++ * bitmaps start out all edge-triggered.  The APIC page restored by
++ * vlapic_snapshot() carries the TMR bits, but the EOI-exit bitmap is not part
++ * of any snapshot, so the guest's EOI for a level-triggered vector would be
++ * completed in hardware and never reach vioapic_process_eoi(): Remote IRR
++ * stays set and the pin (e.g. the ACPI SCI) delivers nothing after its first
++ * interrupt.  Called with all vCPUs frozen, after both the vioapic and the
++ * vlapic state have been restored (vlapic_set_tmr_level() matches the
++ * destination against the restored APIC ID, LDR and DFR).
++ */
++void
++vioapic_restore_tmr(struct vm *vm)
++{
++	struct vcpu *vcpu;
++	uint16_t i, maxcpus;
++
++	maxcpus = vm_get_maxcpus(vm);
++	for (i = 0; i < maxcpus; i++) {
++		vcpu = vm_vcpu(vm, i);
++		if (vcpu == NULL)
++			continue;
++		vioapic_update_tmr(vcpu, NULL);
++	}
++}
+ #endif
+--- a/sys/amd64/vmm/io/vioapic.h
++++ b/sys/amd64/vmm/io/vioapic.h
+@@ -53,6 +53,7 @@
+ #ifdef BHYVE_SNAPSHOT
+ int	vioapic_snapshot(struct vioapic *vioapic,
+ 			 struct vm_snapshot_meta *meta);
++void	vioapic_restore_tmr(struct vm *vm);
+ #endif
+ 
+ #endif /* _KERNEL */
+--- a/sys/amd64/vmm/vmm.c
++++ b/sys/amd64/vmm/vmm.c
+@@ -2072,6 +2072,20 @@
+ 		       __func__, meta->dev_req);
+ 		ret = (EINVAL);
+ 	}
++
++	/*
++	 * The vlapic trigger-mode registers (and the VMCS EOI-exit bitmaps
++	 * behind them) are derived from the vioapic redirection table and the
++	 * vlapic addressing state, not saved: rebuild them once either part is
++	 * restored.  bhyve restores the vioapic before the vlapic, so the
++	 * rebuild after the vlapic is the one that counts; doing it after
++	 * both keeps the result independent of that order.  The ioctl holds
++	 * every vCPU frozen (VMMDEV_IOCTL_LOCK_ALL_VCPUS).
++	 */
++	if (ret == 0 && meta->op == VM_SNAPSHOT_RESTORE &&
++	    (meta->dev_req == STRUCT_VIOAPIC || meta->dev_req == STRUCT_VLAPIC))
++		vioapic_restore_tmr(vm);
++
+ 	return (ret);
+ }
+ 
