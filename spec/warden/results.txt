@@ -1,0 +1,77 @@
+quint 0.32.0, seed 0x5eed, steps 80, samples 20000 (design) / 5000 (mutants)
+sim   designAws              safety                        20000 x 80  ok       (expect ok      )  163.3s 
+sim   designAzure            safetyStrict                  20000 x 80  ok       (expect ok      )  161.9s (surrogate mode: no cloud credential in the VM either)
+sim   designAws              noCloudCredInSandbox           5000 x 80  VIOLATED (expect VIOLATED)    9.1s by decision 5: AWS mode hands the VM 15-min credentials
+wit   designAws wMinted was witnessed in 932 trace(s) out of 20000 explored (4.66%)
+wit   designAws wServed was witnessed in 57 trace(s) out of 20000 explored (0.29%)
+wit   designAws wEscMinted was witnessed in 128 trace(s) out of 20000 explored (0.64%)
+wit   designAws wShorterTtl was witnessed in 214 trace(s) out of 20000 explored (1.07%)
+wit   designAws wDenied was witnessed in 6843 trace(s) out of 20000 explored (34.22%)
+wit   designAws wWithdrawn was witnessed in 1623 trace(s) out of 20000 explored (8.12%)
+wit   designAws wBlocked was witnessed in 16942 trace(s) out of 20000 explored (84.71%)
+wit   designAws wExpiredRefused was witnessed in 7432 trace(s) out of 20000 explored (37.16%)
+wit   designAws wStaleVersionRefused was witnessed in 5746 trace(s) out of 20000 explored (28.73%)
+wit   designAws wPasskeyRefused was witnessed in 7810 trace(s) out of 20000 explored (39.05%)
+wit   designAws wOrphanMint was witnessed in 370 trace(s) out of 20000 explored (1.85%)
+wit   designAws wLateAdopted was witnessed in 11 trace(s) out of 20000 explored (0.06%)
+wit   designAws wRemint was witnessed in 8 trace(s) out of 20000 explored (0.04%)
+wit   designAws wRemintAfterLoss was witnessed in 3 trace(s) out of 20000 explored (0.01%)
+wit   designAws wRevokeApplied was witnessed in 698 trace(s) out of 20000 explored (3.49%)
+wit   designAws wRefusedExpiredJwt was witnessed in 298 trace(s) out of 20000 explored (1.49%)
+wit   designAws wBrokerCrash was witnessed in 80 trace(s) out of 20000 explored (0.40%)
+wit   designAws wReconciled was witnessed in 249 trace(s) out of 20000 explored (1.24%)
+wit   designAws wStaleEpochRefused was witnessed in 11 trace(s) out of 20000 explored (0.06%)
+wit   designAws wIpRemint was witnessed in 22 trace(s) out of 20000 explored (0.11%)
+wit   designAws wSupersededRevoked was witnessed in 356 trace(s) out of 20000 explored (1.78%)
+wit   designAws wWithdrawRevoked was witnessed in 200 trace(s) out of 20000 explored (1.00%)
+wit   designAws wOrphanRevoked was witnessed in 131 trace(s) out of 20000 explored (0.66%)
+wit   designAws wResumed was witnessed in 19690 trace(s) out of 20000 explored (98.45%)
+wit   designAws wBrokerResynced was witnessed in 20 trace(s) out of 20000 explored (0.10%)
+sim   asWrittenEnd           credWithinApprovedTtl          5000 x 80  VIOLATED (expect VIOLATED)    5.4s pre-2026-10-07: re-mint while live outlives the TTL
+sim   asWrittenRevoke        revokedCredsUnusable           5000 x 80  VIOLATED (expect VIOLATED)    5.9s pre-2026-10-07: revoke cutoff dated at the revoke
+sim   sessionTemplateButton  mintedMatchesApproval          5000 x 80  VIOLATED (expect VIOLATED)    6.4s pre-2026-10-07: the session-template button
+sim   sessionTemplateButton  noMintWithoutUserApproval      5000 x 80  ok       (expect ok      )   40.9s (still a user act, but not on the minted card)
+sim   approvalNotHashBound   mintedMatchesApproval          5000 x 80  VIOLATED (expect VIOLATED)    5.7s 
+sim   editInPlace            mintedMatchesApproval          5000 x 80  VIOLATED (expect VIOLATED)    5.7s 
+sim   blindRetry             atMostOneMintPerSlot           5000 x 80  VIOLATED (expect VIOLATED)    5.6s 
+sim   waitForAnswer          settledAttemptResolvable       5000 x 80  VIOLATED (expect VIOLATED)    5.6s 
+sim   passkeyNotBound        escalationHasFreshPasskey      5000 x 80  VIOLATED (expect VIOLATED)    7.0s 
+sim   passkeyNotFresh        escalationHasFreshPasskey      5000 x 80  VIOLATED (expect VIOLATED)    5.9s 
+sim   rawForward             noCloudCredInSandbox           5000 x 80  VIOLATED (expect VIOLATED)    9.3s 
+sim   forwardJwt             noFederatedCredInSandbox       5000 x 80  VIOLATED (expect VIOLATED)    5.5s 
+sim   ttlNotClamped          credWithinApprovedTtl          5000 x 80  VIOLATED (expect VIOLATED)    5.6s 
+sim   expiryAtRequest        credWithinApprovedTtl          5000 x 80  VIOLATED (expect VIOLATED)    9.1s 
+sim   expiryAtClick          deadCardsNotRedeemed           5000 x 80  VIOLATED (expect VIOLATED)    5.5s 
+sim   draftApproves          noMintWithoutUserApproval      5000 x 80  VIOLATED (expect VIOLATED)    5.5s 
+sim   replayExtends          oneGrantPerApproval            5000 x 80  VIOLATED (expect VIOLATED)    5.3s 
+sim   trustClaimed           sandboxOnlyOwnCreds            5000 x 80  VIOLATED (expect VIOLATED)   19.1s 
+sim   staleEpochAccepted     brokerHonoursCurrentEpoch      5000 x 80  VIOLATED (expect VIOLATED)   14.2s 
+sim   noReconciler           orphansReconcilable            5000 x 80  VIOLATED (expect VIOLATED)    5.7s 
+sim   supersedeKeepsGrant    oneLiveGrantPerTask            5000 x 80  VIOLATED (expect VIOLATED)    6.1s 
+sim   resumeWithoutBrokerAck brokerHonoursCurrentEpoch      5000 x 80  VIOLATED (expect VIOLATED)   39.2s 
+sim   orphanOnlyRecorded     orphansReconcilable            5000 x 80  VIOLATED (expect VIOLATED)    5.6s 
+runs  runsDesignAws              happyPathTest|escalationTest|lostAnswerRemintTest|expiredJwtRefusedTest|awsEcsHandsVmCredsTest|reconcileTest|resumeAckTest|brokerRestartPullTest|withdrawRevokesTest|supersedeRevokesTest|ipChangeRemintTest|passkeyBindsShortTtlTest|passkeyShortTtlTest|^(?!rawForward).*DesignTest passed 30 failed 0 (expect all-pass)
+runs  runsDesignAzure            happyPathTest|escalationTest|lostAnswerRemintTest|rawForwardDesignTest passed 4 failed 0 (expect all-pass)
+runs  runsApprovalNotHashBound   ^approvalNotHashBoundBreaksTest$                             passed 1 failed 0 (expect all-pass)
+runs  runsEditInPlace            ^editInPlaceBreaksTest$                                      passed 1 failed 0 (expect all-pass)
+runs  runsBlindRetry             ^blindRetryBreaksTest$                                       passed 1 failed 0 (expect all-pass)
+runs  runsWaitForAnswer          ^waitForAnswerBreaksTest$                                    passed 1 failed 0 (expect all-pass)
+runs  runsPasskeyNotBound        ^passkeyNotBoundBreaksTest$                                  passed 1 failed 0 (expect all-pass)
+runs  runsPasskeyNotFresh        ^passkeyNotFreshBreaksTest$                                  passed 1 failed 0 (expect all-pass)
+runs  runsRawForward             ^rawForwardBreaksTest$                                       passed 1 failed 0 (expect all-pass)
+runs  runsForwardJwt             ^forwardJwtBreaksTest$                                       passed 1 failed 0 (expect all-pass)
+runs  runsTtlNotClamped          ^ttlNotClampedBreaksTest$                                    passed 1 failed 0 (expect all-pass)
+runs  runsExpiryAtRequest        ^expiryAtRequestBreaksTest$                                  passed 1 failed 0 (expect all-pass)
+runs  runsExpiryAtClick          ^expiryAtClickBreaksTest$                                    passed 1 failed 0 (expect all-pass)
+runs  runsDraftApproves          ^draftApprovesBreaksTest$                                    passed 1 failed 0 (expect all-pass)
+runs  runsReplayExtends          ^replayExtendsBreaksTest$                                    passed 1 failed 0 (expect all-pass)
+runs  runsTrustClaimed           ^trustClaimedBreaksTest$                                     passed 1 failed 0 (expect all-pass)
+runs  runsAsWrittenEnd           ^asWrittenEndBreaksTest$                                     passed 1 failed 0 (expect all-pass)
+runs  runsAsWrittenRevoke        ^asWrittenRevokeBreaksTest$                                  passed 1 failed 0 (expect all-pass)
+runs  runsSessionTemplateButton  ^sessionTemplateBreaksTest$                                  passed 1 failed 0 (expect all-pass)
+runs  runsStaleEpochAccepted     ^staleEpochAcceptedBreaksTest$                               passed 1 failed 0 (expect all-pass)
+runs  runsNoReconciler           ^noReconcilerBreaksTest$                                     passed 1 failed 0 (expect all-pass)
+runs  runsSupersedeKeepsGrant    ^supersedeKeepsGrantBreaksTest$                              passed 1 failed 0 (expect all-pass)
+runs  runsResumeWithoutBrokerAck ^resumeWithoutBrokerAckBreaksTest$                           passed 1 failed 0 (expect all-pass)
+runs  runsOrphanOnlyRecorded     ^orphanOnlyRecordedBreaksTest$                               passed 1 failed 0 (expect all-pass)
+failures: 0
