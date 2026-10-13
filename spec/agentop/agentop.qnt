@@ -1,5 +1,7 @@
 // -*- mode: Bluespec; -*-
-// agentop.qnt: agent operations (design/AGENT-OPERATIONS.md), what agents add to the operation contract.
+// agentop.qnt: agent operations, revision 1 of design/AGENT-OPERATIONS.md. Kept as evidence under its assumptions:
+// model calls are atomic and of known cost, yard-node always knows whether a VM lives, the broker never crashes,
+// and approval is part of the apply. Revision 2 replaces it with broker.qnt, executor.qnt and apply.qnt.
 //
 // The wire (identity, delivery, deadlines, the commit-before-ack handoff) is cordis RFC 0007's and is modelled
 // there (cordis operation/capture/expiry.qnt, halo-flash spec/operation). This model takes an accepted attempt
