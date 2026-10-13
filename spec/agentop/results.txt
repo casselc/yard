@@ -18,13 +18,14 @@ sim   executor             bindByCid                  attributed               V
 sim   executor             unreachableIsStopped       stoppedIsStopped         VIOLATED (expect VIOLATED)
 sim   executor             endBeforeRevoke            noSpendAfterFinal        VIOLATED (expect VIOLATED)
 sim   executor             captureFromUnstopped       candidateStable          VIOLATED (expect VIOLATED)
-wit   executor edesign wCompleted was witnessed in 3550 trace(s) out of 10000 explored (35.50%)
-wit   executor edesign wLost was witnessed in 6317 trace(s) out of 10000 explored (63.17%)
-wit   executor edesign wFencedAlive was witnessed in 3594 trace(s) out of 10000 explored (35.94%)
-wit   executor edesign wFencedRefused was witnessed in 973 trace(s) out of 10000 explored (9.73%)
-wit   executor edesign wUpgraded was witnessed in 4936 trace(s) out of 10000 explored (49.36%)
-wit   executor edesign wRealloc was witnessed in 2649 trace(s) out of 10000 explored (26.49%)
-wit   executor edesign wRevokePending was witnessed in 8377 trace(s) out of 10000 explored (83.77%)
+wit   executor edesign wCompleted was witnessed in 3466 trace(s) out of 10000 explored (34.66%)
+wit   executor edesign wLost was witnessed in 6274 trace(s) out of 10000 explored (62.74%)
+wit   executor edesign wFencedAlive was witnessed in 3284 trace(s) out of 10000 explored (32.84%)
+wit   executor edesign wFencedRefused was witnessed in 690 trace(s) out of 10000 explored (6.90%)
+wit   executor edesign wUpgraded was witnessed in 4967 trace(s) out of 10000 explored (49.67%)
+wit   executor edesign wRealloc was witnessed in 2605 trace(s) out of 10000 explored (26.05%)
+wit   executor edesign wRevokePending was witnessed in 8340 trace(s) out of 10000 explored (83.40%)
+wit   executor edesign wWatchdog was witnessed in 1854 trace(s) out of 10000 explored (18.54%)
 sim   apply                adesign                    safety                   ok       (expect ok)
 sim   apply                aEnabledUntested           safety                   ok       (expect ok)
 sim   apply                aAutoConfigured            safety                   ok       (expect ok)
@@ -35,6 +36,7 @@ sim   apply                approvalByName             approvedApplied          V
 sim   apply                applyStaleBase             noLostUpdate             VIOLATED (expect VIOLATED)
 sim   apply                autoApproveUnconfigured    noAutoUnlessConfigured   VIOLATED (expect VIOLATED)
 sim   apply                ackReleasesArtifacts       neededPresent            VIOLATED (expect VIOLATED)
+sim   apply                substituteEmpty            approvedApplied          VIOLATED (expect VIOLATED)
 wit   apply adesign wApplied was witnessed in 1424 trace(s) out of 10000 explored (14.24%)
 wit   apply adesign wConflict was witnessed in 88 trace(s) out of 10000 explored (0.88%)
 wit   apply adesign wRefusedExpired was witnessed in 5390 trace(s) out of 10000 explored (53.90%)
@@ -61,9 +63,5 @@ wit   agentop design wConflict was witnessed in 685 trace(s) out of 10000 explor
 wit   agentop design wDenied was witnessed in 2299 trace(s) out of 10000 explored (22.99%)
 wit   agentop autoConfigured wAutoApplied was witnessed in 2778 trace(s) out of 10000 explored (27.78%)
 failures: 0
-deep (100000 x 80) bdesign: [ok] No violation found (11865ms at 8428 traces/second).
-deep (100000 x 80) edesign: [ok] No violation found (35590ms at 2810 traces/second).
-deep (100000 x 80) adesign: [ok] No violation found (66154ms at 1512 traces/second).
-deep (100000 x 80) aAutoConfigured: [ok] No violation found (68671ms at 1456 traces/second).
-second seed 0xc0ffee (10000 x 40, every check above):
-  failures: 0
+deep (100000 x 80) edesign: [ok] No violation found (35929ms at 2783 traces/second).
+deep (100000 x 80) adesign: [ok] No violation found (66429ms at 1505 traces/second).

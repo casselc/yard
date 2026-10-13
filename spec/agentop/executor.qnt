@@ -41,7 +41,7 @@ module executor {
     fenceOwed: Set[int],          // tombstones yard-ctl owes yard-node (durable), delivered when reachable
     reachable: bool, partitions: int,
     // ghosts
-    misattributed: bool, spentAfterFinal: bool, reallocs: int, refusedCalls: int, upgraded: int,
+    misattributed: bool, spentAfterFinal: bool, reallocs: int, refusedCalls: int, upgraded: int, watchdogs: int,
   }
   var s: S
 
@@ -53,7 +53,7 @@ module executor {
   action init = s' = {
     att: ATTEMPTS.mapBy(_ => A0), vms: ALLOCS.mapBy(_ => V0), nextAl: 0,
     scopes: KEYS.mapBy(_ => -1), revoking: Set(), fenceOwed: Set(), reachable: true, partitions: 0,
-    misattributed: false, spentAfterFinal: false, reallocs: 0, refusedCalls: 0, upgraded: 0,
+    misattributed: false, spentAfterFinal: false, reallocs: 0, refusedCalls: 0, upgraded: 0, watchdogs: 0,
   }
 
   def A(a: int): Att = s.att.get(a)
@@ -212,6 +212,13 @@ module executor {
     all { V(al).alive, s' = setV(s, al, { ...V(al), alive: false }) }
   }
 
+  // yard-node's watchdog: an allocation whose lease yard-ctl stopped renewing (yard-ctl unreachable) is stopped by
+  // the node itself, which bounds a lost worker's life even while nothing reaches it
+  action watchdog: bool = {
+    nondet al = ALLOCS.oneOf()
+    all { not(s.reachable), V(al).alive, s' = { ...setV(s, al, { ...V(al), alive: false }), watchdogs: s.watchdogs + 1 } }
+  }
+
   action partition: bool = all { s.reachable, s.partitions < 2,
                                  s' = { ...s, reachable: false, partitions: s.partitions + 1 } }
   action heal: bool = all { not(s.reachable), s' = { ...s, reachable: true } }
@@ -219,7 +226,7 @@ module executor {
   action step = any {
     accept, allocate, observeStarted, observeAbsent, beginCapture, snapshot, observeLost, fenceUnreachable,
     confirmStopped, finalise, revokeApply, nodeStart, nodeDrop, nodeFence, vmCall, vmWrite, vmFinish, vmCrash,
-    partition, heal,
+    watchdog, partition, heal,
   }
 
   // ---- properties -------------------------------------------------------------------------------------------
@@ -245,5 +252,6 @@ module executor {
   val wFencedRefused: bool = ATTEMPTS.exists(a => A(a).exec == Fenced) and s.refusedCalls > 0
   val wUpgraded: bool = s.upgraded > 0
   val wRealloc: bool = s.reallocs > 0 and ATTEMPTS.exists(a => A(a).stage == Ended and A(a).out == Completed)
+  val wWatchdog: bool = s.watchdogs > 0 and ATTEMPTS.exists(a => A(a).exec == Fenced)
   val wRevokePending: bool = ATTEMPTS.exists(a => A(a).stage == Ending and s.revoking.contains(key(A(a).al)))
 }

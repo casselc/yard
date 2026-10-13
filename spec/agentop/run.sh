@@ -45,7 +45,7 @@ sim $E bindByCid            attributed        VIOLATED
 sim $E unreachableIsStopped stoppedIsStopped  VIOLATED
 sim $E endBeforeRevoke      noSpendAfterFinal VIOLATED
 sim $E captureFromUnstopped candidateStable   VIOLATED
-wit $E edesign wCompleted wLost wFencedAlive wFencedRefused wUpgraded wRealloc wRevokePending
+wit $E edesign wCompleted wLost wFencedAlive wFencedRefused wUpgraded wRealloc wRevokePending wWatchdog
 A=apply_modes.qnt
 sim $A adesign                 safety                 ok
 sim $A aEnabledUntested        safety                 ok
@@ -57,6 +57,7 @@ sim $A approvalByName          approvedApplied        VIOLATED
 sim $A applyStaleBase          noLostUpdate           VIOLATED
 sim $A autoApproveUnconfigured noAutoUnlessConfigured VIOLATED
 sim $A ackReleasesArtifacts    neededPresent          VIOLATED
+sim $A substituteEmpty         approvedApplied        VIOLATED
 wit $A adesign wApplied wConflict wRefusedExpired wRefusedAuthority wAckedThenApplied wReleased
 wit $A aAutoConfigured wAutoApplied
 F=agentop_modes.qnt

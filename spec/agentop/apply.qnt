@@ -17,9 +17,10 @@
 //  bound     the content applied is the digest that was approved, not whatever the name holds now
 //  cas       apply is a compare-and-set on the approved base
 //  autoGate  automated approval only on a cell where it is enabled and its harness is tested
+//  explicit  an unavailable artifact fails the apply explicitly; it is never applied as empty content
 //  lease     acknowledging the operation drops only its own lease; an artifact goes only when no lease holds it
 module apply {
-  type Rules = { approval: bool, expiry: bool, authority: bool, bound: bool, cas: bool, autoGate: bool, lease: bool }
+  type Rules = { approval: bool, expiry: bool, authority: bool, bound: bool, cas: bool, autoGate: bool, lease: bool, explicit: bool }
   const RULES: Rules
   const AUTO_ENABLED: bool
   const HARNESS_TESTED: bool
@@ -141,13 +142,14 @@ module apply {
     all {
       x.st != NoCand, p.st != Applied, s.appliedCount.get(c) == 0,
       if (not(ok)) s' = { ...s, out: { ...s.out, refused: s.out.refused + 1 } }
-      else if (x.st != Held) s' = { ...s, out: { ...s.out, unavailable: s.out.unavailable + 1 } }   // explicit
+      else if (x.st != Held and RULES.explicit) s' = { ...s, out: { ...s.out, unavailable: s.out.unavailable + 1 } }   // explicit
       else if (RULES.cas and s.head != base) s' = { ...s, out: { ...s.out, conflicts: s.out.conflicts + 1 } }
-      else s' = { ...setP(s, c, { ...p, st: Applied }), head: content,
+      else s' = { ...setP(s, c, { ...p, st: Applied }), head: if (x.st == Held) content else 0,
                   out: { ...s.out, applied: s.out.applied + 1 },
                   appliedCount: s.appliedCount.setBy(c, n => n + 1),
                   lostUpdate: s.lostUpdate or s.head != base,
-                  appliedBad: s.appliedBad or not(granted and unexpired and s.authority and content == p.digest) },
+                  appliedBad: s.appliedBad or not(granted and unexpired and s.authority and content == p.digest
+                                                   and x.st == Held) },
     }
   }
 

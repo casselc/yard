@@ -1,6 +1,7 @@
-# Agent operations: Cordis delegating to coding agents through yard (draft, revision 2, 2026-10-13)
+# Agent operations: Cordis delegating to coding agents through yard (draft, revision 2.1, 2026-10-13)
 
-Status: **draft, revision 2**. This is yard's half; Cordis RFC 0008 is Cordis's half. It extends Cordis RFC 0007
+Status: **draft, revision 2.1**. This is yard's half; Cordis RFC 0008 (revision 3, `casselc/jolt-sim`) is Cordis's
+half, and the two use one vocabulary. It extends Cordis RFC 0007
 ("Boundaries, and the inference operation contract") from inference to coding agents.
 - The sandbox choice is `design/SANDBOX-LINUX.md`.
 - The models are `spec/agentop/`.
@@ -97,7 +98,7 @@ its copy (RFC 0007). The reasons:
 - `capacity`, with a retry-after;
 - `not_permitted`: the cell, agent, route or limits exceed the runner configuration;
 - `invalid_task`;
-- `unknown_valuation`;
+- `valuation_changed` (409);
 - `limits_missing`: tokens, money and time are each required;
 - `input_unavailable`.
 
@@ -105,29 +106,31 @@ its copy (RFC 0007). The reasons:
 
 | Outcome | Meaning |
 |---|---|
-| `completed` | The harness finished and its output **passed structural validation** against the task's schema |
-| `insufficient_information` | The harness finished and said it cannot do the task with what it has; its questions are data (no resumption, section 12) |
+| `completed` | The harness finished and its output **passed structural validation** against the task's schema. The value (the findings) is carried in the receipt itself, so acceptance never depends on an artifact lease |
+| `insufficient` | The harness finished and said it cannot do the task with what it has; its questions are data (no resumption, section 12) |
 | `invalid_output` | The harness finished; its output failed structural validation. **The raw output and the errors are kept** |
 | `budget_exhausted` | The broker refused a call at a limit (`tokens` or `money`), and the harness stopped |
-| `timed_out` | The task's wall-time limit passed; yard-ctl stopped the worker |
+| `timeout` | The task's wall-time limit passed; yard-ctl stopped the worker |
 | `cancelled` | The cancel verb; yard-ctl stopped the worker |
-| `worker_lost` | The VM died, or yard-node became unreachable and the worker was fenced |
-| `executor_error` | Yard's own fault after acceptance (a capture step failed) |
+| `worker_failed` | The VM died, yard-node became unreachable and the worker was fenced, or a capture step failed (the artifacts it could not capture are listed as unavailable) |
 
 Every terminal outcome carries the same three fields:
 - **`execution`:**
   - `stopped` means yard-node confirmed that the worker's process is gone.
-  - `fenced` means the worker could not be confirmed stopped. Its broker access is revoked and its result is not
-    captured. A later fact upgrades it to `stopped` when yard-node confirms.
-- **`usage`:** for each dimension (tokens, money in integer µUSD, wall seconds), `confirmed` plus `unresolved_max`.
-  The charge is their sum. It also carries the pinned valuation id.
-- **`accounting`:**
+  - `unconfirmed` means the worker could not be confirmed stopped (it was fenced, section 5). Its broker access is
+    revoked and its result is not captured. A later fact upgrades it to `stopped` when yard-node confirms.
+- **`usage`:** for each dimension (tokens, money in integer µUSD, wall seconds), `confirmed` plus `unresolved_max`,
+  and the pinned valuation.
+- **`spend`:** `{ certainty, charge }`, the charge in integer µUSD (confirmed plus unresolved maxima, at the pinned
+  valuation):
   - `exact`: every model call's usage was confirmed by its answer.
   - `bounded`: at least one call was unanswered. It is charged at its reserved maximum, so the true cost is at most
     the charge.
 
 **The outcome is final, and `done` is reported, only after** the worker is stopped or fenced, the broker has
-confirmed the scope revoked, and the local route's unresolved calls have been resolved (section 6).
+confirmed the scope revoked, and the local route's unresolved calls have been resolved (section 6). If the broker
+cannot be reached to revoke, the operation stays `running`, marked `degraded`, and its reservation holds. At the
+operation's deadline it is `unknown`, settled at the whole reservation.
 
 **Partial artifacts come with every outcome that has them:**
 - the transcript;
@@ -185,7 +188,7 @@ external happens, never reused. Everything about that worker is keyed by it:
   allocates again at most once. A worker that never started has spent nothing.
 - **F4. An unreachable worker is not a stopped worker.** If yard-node is unreachable past the bound:
   - yard-ctl revokes the allocation's scope and owes yard-node a tombstone;
-  - the attempt ends `worker_lost` with execution `fenced`;
+  - the attempt ends `worker_failed` with execution `unconfirmed`;
   - the VM's memory and CPU stay counted against capacity until yard-node confirms it gone. On reconnect, yard-node
     kills it, and a fact upgrades the execution to `stopped`.
 - **F5.** Nothing is captured from a worker that is not confirmed stopped, or from an allocation that is not the
@@ -194,9 +197,12 @@ external happens, never reused. Everything about that worker is keyed by it:
 - **F6.** The accounting is final only after the broker confirms the revocation (section 4).
 - **F7.** yard-node reconciles on start and on reconnect: it kills any VM whose allocation yard-ctl does not list
   as current.
+- **F8. A watchdog bounds a lost worker's life.** Each allocation has a lease that yard-ctl renews. If the lease
+  expires (yard-ctl cannot reach the node), yard-node stops the VM itself. This holds even while nothing reaches the
+  node.
 
 **Cancel and the time limit.** yard-ctl stops the worker (stop, then reap), then captures and ends. A worker that
-cannot be stopped because its node is unreachable is fenced (F4).
+cannot be stopped because its node is unreachable is fenced (F4), and the watchdog (F8) stops it.
 
 ## 6. The broker: valuation, limits and reservations
 
@@ -207,17 +213,24 @@ the broker, outside the graph and the mutation protocol.
 The agent (through its graph) can choose among the routes it is permitted, set limits **at or below** its
 ceilings, and choose retry strategies. It cannot create or change a valuation.
 
-The task names a valuation id from yard's contract. yard-ctl refuses an unknown one and **pins** it for the
-attempt. Every reservation and every settlement of that attempt uses it. A price change applies to later attempts
+The valuation is identified by the digest of its price table, published in yard's contract. The outbox reads it
+and sends it with the submit; the cell never names it. yard-ctl **pins** it for the attempt. A submit made with a
+stale valuation is refused with `409 valuation_changed` (not executed), and the outbox re-reads the contract. Every
+reservation and every settlement of that attempt uses the pinned valuation. A price change applies to later attempts
 only.
+
+**Cordis's unit is the µUSD.** Yard converts tokens and route prices to µUSD once, rounding up, and Cordis reserves
+the task's `micro_usd` limit. So **the local route needs a nominal price** from the operator (per token, or per
+engine second). Without one, a local review reserves nothing in Cordis's budget, and only yard's token limit bounds
+it.
 
 **Three limits, each enforced on its own:**
 - **tokens:** all classes, counted by the broker;
 - **money:** µUSD under the pinned valuation, counted by the broker;
 - **wall time:** seconds, enforced by yard-ctl.
 
-The local route costs no money, so it is the token limit that bounds it. The operator's ceiling for every limit
-is mandatory.
+The token limit bounds the local route on its own, whatever its nominal price. The operator's ceiling for every
+limit is mandatory.
 
 **Reserve, send, settle.** The ledger is SQLite (WAL, synchronous=FULL), one row per model call.
 
@@ -294,8 +307,8 @@ pack with git's strict object checks and stores the candidate in the artifact st
 
    The record holds a lease on the candidate's artifacts. The card shows the differ's diff, never the agent's
    description of it.
-3. The decision is observed by polling the approval's status (`pending`, `approved`, `denied`, `expired`,
-   `revoked`). No operation is running while a person decides.
+3. The decision reaches the workflow as an input, like any outside event. It can also be read from the approval's
+   status (`pending`, `approved`, `denied`, `expired`, `revoked`). No operation is running while a person decides.
 4. **`workspace.apply(approval)`** is a short compare-and-set operation. **When it runs**, it checks that:
    - the approval is approved, unexpired and not revoked;
    - the cell still has the authority to apply to the target, from the runner configuration at that moment;
@@ -381,7 +394,7 @@ VM boot is 126 ms (P0-2), which is small next to a review's minutes, so it is no
 
 ## 12. Deferred: interactive continuation and native delegation
 
-The first milestones run **non-interactive** tasks. A harness that needs more ends `insufficient_information`
+The first milestones run **non-interactive** tasks. A harness that needs more ends `insufficient`
 with its questions, and Cordis decides what to do: answer them in a new attempt, or ask a person.
 
 **Fan-out is Cordis's.** Several reviewers, a quorum, escalation and cross-review are cells and manifests
@@ -425,7 +438,7 @@ All are score facts, with supersede and retract.
 | G1 | yard-ctl → yard-node: start allocation a | running / absent, exited / lost answer, late request | start bound | VM table by a | tombstone before allocating again (F3) | `restartStartsAgain` (executor) |
 | G2 | broker → model: a call | answered / refused / no answer | call timeout | the ledger; Halo's operation status (local) | reserve the maximum durably first; hold it unanswered | `checkConfirmedOnly`, `volatileReserve`, `dropUnanswered` (broker) |
 | G3 | yard-ctl → broker: revoke a's scope | revoked / — / not yet confirmed | resend until confirmed | the scope table | final only after confirmation (F6) | `endBeforeRevoke` (executor) |
-| G4 | yard-ctl → yard-node: stop a | reaped / — / node unreachable | stop bound | VM table; pidfd | unreachable is `fenced`, not `stopped` (F4) | `unreachableIsStopped` (executor) |
+| G4 | yard-ctl → yard-node: stop a | reaped / — / node unreachable | stop bound | VM table; pidfd | unreachable is `unconfirmed`, not `stopped` (F4, F8) | `unreachableIsStopped` (executor) |
 | G5 | capture a's result | snapshot named a exists / — / partial | capture bound | the snapshot and artifact rows | only from a stopped, current allocation (F5) | `captureFromUnstopped` (executor) |
 | G6 | approval | approved / denied, expired, revoked / pending | expiry | the approval record | checked again when apply runs | `expiryAtApproval`, `authorityAtRequest` (apply) |
 | G7 | apply | ref moved / conflict, refused, unavailable / lost answer | apply bound | the target ref | compare-and-set on the approved base, the approved digest | `applyStaleBase`, `approvalByName` (apply) |
@@ -471,7 +484,8 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - yard-node partitions with VMs still running;
   - delayed revocation;
   - workers that write after they finish;
-  - every VM on CID 3.
+  - every VM on CID 3;
+  - yard-node's watchdog stopping a VM whose lease lapsed.
 - **Properties:**
   - `oneLive`;
   - `attributed`: a call is charged to its worker's attempt;
@@ -507,7 +521,8 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - `approvalByName`;
   - `applyStaleBase`;
   - `autoApproveUnconfigured`;
-  - `ackReleasesArtifacts`.
+  - `ackReleasesArtifacts`;
+  - `substituteEmpty`: a released candidate applied as empty content (with the ack releasing artifacts).
 
 **`agentop.qnt`: revision 1's model, kept.** It holds under its own assumptions:
 - atomic calls of known cost;
@@ -520,7 +535,7 @@ Revision 2 does not rely on it.
 **Results** (quint 0.32, seed 0x5eed, 10,000 samples × 40 steps; `spec/agentop/results.txt`):
 - **The designs hold:** `bdesign`, `edesign`, and `adesign` in all three approval configurations. Revision 1's
   model holds in its three as well.
-- **Each mutant breaks the property it names:** 6 in the broker, 5 in the executor, 7 in apply, and revision 1's 7.
+- **Each mutant breaks the property it names:** 6 in the broker, 5 in the executor, 8 in apply, and revision 1's 7.
 - **Every witness is reached:**
   - concurrent calls in flight;
   - a bounded report and an exact one;
@@ -532,6 +547,7 @@ Revision 2 does not rely on it.
   - a fenced execution upgraded to stopped;
   - a re-allocation that completed;
   - a pending revocation;
+  - a watchdog stopping a fenced worker;
   - apply, conflict, expired and unauthorised refusals, apply after acknowledgement, and an automated apply on the
     configured cell.
 
@@ -542,9 +558,9 @@ Deep runs and a second seed are in `results.txt`.
 | # | Work | Exit |
 |---|---|---|
 | **AG0** | This revision and the models | The designs hold; each mutant breaks its property; every witness is reached |
-| **AG1** | The review task by hand on the Halo: the harness image (the P0-2 guest plus Node, Claude Code, ripgrep, git); the claude driver; input images per commit; the broker's ledger with reservations and the local route through Halo operations | The section 9 review runs in a VM against a fixture repository and returns a valid `Review`. Section 10's measurements are recorded. Disallowed tools are refused (verified in the transcript) |
-| **AG2** | yard-ctl serves the envelope for `api: "agent"`: stages, allocations, fencing, outcomes with certainty, artifacts with leases | The fault probe passes at every stage: a lost start answer; a late start; yard-node unreachable (SIGSTOP), then back; a killed VM; a yard-ctl restart; a broker crash mid-call; a lost model answer; a delayed revocation. Every outcome's certainty is true to the injected fault |
-| **AG3** | Cordis: the envelope with a yard adapter; `agent.run` and the review cell (RFC 0008) | **The first deliverable:** a Cordis review workflow with the review cell, through the milestone's faults, with the evidence manifest |
+| **AG1** (Y1a) | The review task by hand on the Halo: the harness image (the P0-2 guest plus Node, Claude Code, ripgrep, git); the claude driver; input images per commit; the broker's ledger with reservations and the local route through Halo operations | The section 9 review runs in a VM against a fixture repository and returns a valid `Review`. Section 10's measurements are recorded. Disallowed tools are refused (verified in the transcript) |
+| **AG2** (Y1a) | yard-ctl serves the envelope for `api: "agent"`: stages, allocations, fencing, outcomes with certainty, artifacts with leases | The fault probe passes at every stage: a lost start answer; a late start (a stale allocation); yard-node unreachable (SIGSTOP), then back; the watchdog's lease expiry; a killed VM; a yard-ctl restart at every stage; a cancel at every stage; a broker crash between reserve and send, and mid-call; a lost model answer; a delayed revocation; an artifact read after its lease. Every outcome's certainty is true to the injected fault |
+| **AG3** (Y1b) | Cordis: the envelope with a yard adapter; `agent.run` and the review cell (RFC 0008) | **The first deliverable:** a Cordis review workflow with the review cell, through the milestone's faults, with the evidence manifest |
 | **AG4** | Writers: read-write clones, the differ VM, candidates | An implementer task returns a candidate whose diff shows modes, symlinks and deletions; the policy refusals fire on crafted trees |
 | **AG5** | Approvals and apply | Approve then apply; deny, expire, withdrawn authority and a moved base each refuse; apply after the operation's acknowledgement still finds the candidate |
 | **AG6** | The brokered Anthropic route: valuations in µUSD, the input bound verified against the provider's counts | The review on the Anthropic route, metered in µUSD; the money limit stops a runaway task; a lost answer is reported `bounded` |
@@ -555,8 +571,8 @@ Deep runs and a second seed are in `results.txt`.
 
 ## 17. Open questions
 
-1. **Cordis's units.** Cordis keeps one integer budget. It can be converted by the operator's pinned valuation, or
-   Cordis can budget the three dimensions itself (RFC 0008).
+1. **The local route's nominal price** (per token or per engine second), which the operator sets so a local
+   review has a Cordis budget (section 6).
 2. **Reconciling bounded provider charges.** The provider's usage reports could later lower a `bounded` charge, as
    an explicit correction fact. Or the bound stands. The draft proposes that the bound stands until AG6 shows how
    often answers are lost.
@@ -564,6 +580,7 @@ Deep runs and a second seed are in `results.txt`.
    retention.
 4. **Retention floors** per artifact kind and run class.
 5. **VM concurrency beside `halo_serve`**, decided from AG1's measurements.
+6. **The allocation lease and the stop bound:** how long a lost worker may live (F4, F8).
 
 ## 18. History
 
@@ -591,3 +608,16 @@ Deep runs and a second seed are in `results.txt`.
   12. The models are extended, and revision 1's results are restated under their assumptions (section 15).
   13. The first milestone is one read-only Claude review against Halo, connected to Cordis (sections 9, 16).
   14. The performance work targets measured bottlenecks, not boot time (section 10).
+- **Revision 2.1 (2026-10-13)** reconciles with the Cordis agent's yard draft (branch `design/agent-operations-r2`)
+  and RFC 0008 revision 3:
+  - It adopts their outcome vocabulary (`insufficient`, `timeout`, `worker_failed`, execution `unconfirmed`,
+    `spend { certainty, charge }`).
+  - It adopts these additions of theirs:
+    - the valuation digest sent by the outbox, refused with `409 valuation_changed`;
+    - µUSD as Cordis's unit;
+    - findings carried in the receipt;
+    - `degraded`, then `unknown` at the deadline, when revocation cannot be confirmed;
+    - the node watchdog (F8);
+    - the approval decision arriving as an input;
+    - their fault list.
+  - It keeps the per-allocation host socket in place of CID and tap attestation, and stop-before-capture.
