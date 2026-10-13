@@ -1,0 +1,63 @@
+{
+ "type": "object",
+ "additionalProperties": false,
+ "required": [
+  "verdict",
+  "findings"
+ ],
+ "properties": {
+  "verdict": {
+   "type": "string",
+   "enum": [
+    "pass",
+    "fail",
+    "insufficient_information"
+   ]
+  },
+  "findings": {
+   "type": "array",
+   "maxItems": 50,
+   "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "file",
+     "line",
+     "severity",
+     "note"
+    ],
+    "properties": {
+     "file": {
+      "type": "string",
+      "maxLength": 300
+     },
+     "line": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "severity": {
+      "type": "string",
+      "enum": [
+       "info",
+       "minor",
+       "major",
+       "critical"
+      ]
+     },
+     "note": {
+      "type": "string",
+      "maxLength": 4000
+     }
+    }
+   }
+  },
+  "questions": {
+   "type": "array",
+   "maxItems": 20,
+   "items": {
+    "type": "string",
+    "maxLength": 1000
+   }
+  }
+ }
+}

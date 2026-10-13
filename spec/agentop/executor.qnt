@@ -15,8 +15,9 @@
 //  stopped   an unreachable worker is recorded fenced, not stopped, until yard-node confirms it is gone
 //  revoke    the attempt's accounting is final only after the broker confirmed the scope revoked
 //  capture   the result is captured only after the worker is confirmed stopped
+//  durableTomb  yard-node's tombstones survive its restart (it reloads them before serving a start)
 module executor {
-  type Rules = { fence: bool, alloc: bool, stopped: bool, revoke: bool, capture: bool }
+  type Rules = { fence: bool, alloc: bool, stopped: bool, revoke: bool, capture: bool, durableTomb: bool }
   const RULES: Rules
 
   pure val NA = 2
@@ -39,7 +40,7 @@ module executor {
     scopes: int -> int,           // the broker's scope table: key -> attempt (-1: none)
     revoking: Set[int],           // revocations sent, not yet applied at the broker
     fenceOwed: Set[int],          // tombstones yard-ctl owes yard-node (durable), delivered when reachable
-    reachable: bool, partitions: int,
+    reachable: bool, partitions: int, nodeRestarts: int,
     // ghosts
     misattributed: bool, spentAfterFinal: bool, reallocs: int, refusedCalls: int, upgraded: int, watchdogs: int,
   }
@@ -52,7 +53,7 @@ module executor {
 
   action init = s' = {
     att: ATTEMPTS.mapBy(_ => A0), vms: ALLOCS.mapBy(_ => V0), nextAl: 0,
-    scopes: KEYS.mapBy(_ => -1), revoking: Set(), fenceOwed: Set(), reachable: true, partitions: 0,
+    scopes: KEYS.mapBy(_ => -1), revoking: Set(), fenceOwed: Set(), reachable: true, partitions: 0, nodeRestarts: 0,
     misattributed: false, spentAfterFinal: false, reallocs: 0, refusedCalls: 0, upgraded: 0, watchdogs: 0,
   }
 
@@ -219,6 +220,14 @@ module executor {
     all { not(s.reachable), V(al).alive, s' = { ...setV(s, al, { ...V(al), alive: false }), watchdogs: s.watchdogs + 1 } }
   }
 
+  // yard-node restarts: its VMs die with it (parent-death signal); start requests already in flight can still
+  // arrive afterwards. Its tombstones survive only if they are durable (the mutant keeps them in memory)
+  action nodeRestart: bool = all {
+    s.nodeRestarts < 2,
+    s' = { ...s, nodeRestarts: s.nodeRestarts + 1,
+           vms: ALLOCS.mapBy(al => { ...V(al), alive: false, tomb: V(al).tomb and RULES.durableTomb }) },
+  }
+
   action partition: bool = all { s.reachable, s.partitions < 2,
                                  s' = { ...s, reachable: false, partitions: s.partitions + 1 } }
   action heal: bool = all { not(s.reachable), s' = { ...s, reachable: true } }
@@ -226,7 +235,7 @@ module executor {
   action step = any {
     accept, allocate, observeStarted, observeAbsent, beginCapture, snapshot, observeLost, fenceUnreachable,
     confirmStopped, finalise, revokeApply, nodeStart, nodeDrop, nodeFence, vmCall, vmWrite, vmFinish, vmCrash,
-    watchdog, partition, heal,
+    watchdog, nodeRestart, partition, heal,
   }
 
   // ---- properties -------------------------------------------------------------------------------------------
@@ -253,5 +262,6 @@ module executor {
   val wUpgraded: bool = s.upgraded > 0
   val wRealloc: bool = s.reallocs > 0 and ATTEMPTS.exists(a => A(a).stage == Ended and A(a).out == Completed)
   val wWatchdog: bool = s.watchdogs > 0 and ATTEMPTS.exists(a => A(a).exec == Fenced)
+  val wTombAcrossRestart: bool = s.nodeRestarts > 0 and ALLOCS.exists(al => V(al).tomb and V(al).requested)
   val wRevokePending: bool = ATTEMPTS.exists(a => A(a).stage == Ending and s.revoking.contains(key(A(a).al)))
 }

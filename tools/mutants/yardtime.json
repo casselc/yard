@@ -1,0 +1,30 @@
+{
+ "package": "./internal/yardtime/",
+ "mutants": [
+  {
+   "name": "processClock",
+   "file": "internal/yardtime/yardtime.go",
+   "old": "\t\tc.base = ceiling\n",
+   "new": "\t\tc.base = 0\n"
+  },
+  {
+   "name": "ceilingBehind",
+   "file": "internal/yardtime/yardtime.go",
+   "old": "if t+Ahead.Milliseconds()/2 > c.ceiling {",
+   "new": "if false {"
+  },
+  {
+   "name": "subtractDowntime",
+   "file": "internal/yardtime/yardtime.go",
+   "old": "if since := wall().UnixMilli() - written; since > 0 {",
+   "new": "if since := wall().UnixMilli() - written; since != 0 {"
+  },
+  {
+   "name": "noDowntime",
+   "file": "internal/yardtime/yardtime.go",
+   "old": "\t\t\tc.base += since\n",
+   "new": "\t\t\t_ = since\n"
+  }
+ ],
+ "notes": "ceilingBehind is clock.qnt's mutant: a time handed out past the persisted ceiling. Persisting the ceiling at exactly the time handed out (not Ahead of it) is equivalent for safety and only costs writes, so it is not listed."
+}

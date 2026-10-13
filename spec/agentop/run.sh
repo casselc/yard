@@ -52,7 +52,8 @@ sim $E bindByCid            attributed        VIOLATED
 sim $E unreachableIsStopped stoppedIsStopped  VIOLATED
 sim $E endBeforeRevoke      noSpendAfterFinal VIOLATED
 sim $E captureFromUnstopped candidateStable   VIOLATED
-wit $E edesign wCompleted wLost wFencedAlive wFencedRefused wUpgraded wRealloc wRevokePending wWatchdog
+sim $E tombstoneVolatile    oneLive           VIOLATED
+wit $E edesign wCompleted wLost wFencedAlive wFencedRefused wUpgraded wRealloc wRevokePending wWatchdog wTombAcrossRestart
 A=apply_modes.qnt
 sim $A adesign                 safety                 ok
 sim $A aEnabledUntested        safety                 ok

@@ -244,7 +244,8 @@ external happens, never reused. Everything about that worker is keyed by it:
   only. A call is charged to the attempt the allocation belongs to. When the allocation ends, the socket is
   unlinked and the scope revoked.
 - **F3.** Before an attempt allocates again (a start that is `absent` past the start bound), its old allocation is
-  **tombstoned** at yard-node, so a late start request for it is refused, and its scope is revoked. An attempt
+  **tombstoned** at yard-node, so a late start request for it is refused, and its scope is revoked. Tombstones are
+  durable at yard-node: it reloads them before it serves a start after its own restart. An attempt
   allocates again at most once. A worker that never started has spent nothing.
 - **F4. An unreachable worker is not a stopped worker.** If yard-node is unreachable past the bound:
   - yard-ctl revokes the allocation's scope and owes yard-node a tombstone;
@@ -319,8 +320,8 @@ it is.
    - The broker serves no call for an attempt until its rows are recovered.
 
 **Input bounds:**
-- **Local route:** the exact count from Halo's tokenizer. Halo needs `POST /v1/messages/count_tokens`, which the
-  Anthropic API also has; this is a small addition on the Halo side.
+- **Local route:** the exact count from Halo's `POST /v1/messages/count_tokens`, which accepts Claude Code's full
+  request body and agrees with the generation's prompt count (`design/AG1.md`).
 - **Provider route:** the provider's count endpoint where one exists. Otherwise the request's byte length, which
   bounds the token count for a byte-level tokenizer. AG6 verifies that bound against the provider's counts before
   any money limit relies on it.
@@ -424,9 +425,9 @@ An apply or a review step that needs it fails with `artifact_unavailable`, and n
 
 | | |
 |---|---|
-| Input | One commit's input image, read-only (`is_read_only` drive, mounted `ro,nodev,nosuid,noexec`), plus the change to review as a file in the task |
+| Input | One commit's tree **with the change applied**, as a read-only input image (`is_read_only` drive, mounted `ro,nodev,nosuid,noexec`), with the diff beside it in `.yard-review/change.diff`, so every finding cites a line that exists in the reviewed tree |
 | Harness | Claude Code in print mode with stream-JSON output, as an unprivileged user in the guest |
-| Tools | Read, Grep and Glob only (an allow-list). Bash, edits, writes, notebooks, web access and **native subagents** are disallowed. No MCP servers. The settings file is read-only in the image. Exact tool names are checked per harness version in AG1 |
+| Tools | Read, Grep and Glob only (`--tools`). `--restricted` removes command-running tools and ignores user, project and local settings files. `--safe-mode` disables CLAUDE.md, skills, hooks, MCP servers and custom agents. No Task tool is offered, so no **native subagent** can run. `--bare` is not used: its simple mode drops Grep and Glob (AG1) |
 | Output | `--json-schema` with `Review = { verdict, findings[{file, line, severity, note}] }` or `InsufficientInformation = { questions }` |
 | Route | Broker → Halo `/v1/operations` with `api: "messages"` (section 6) |
 | Limits | tokens, money (0 on the local route, still enforced), wall time. VM: 2 vCPU, 2 GiB, tmpfs home, the vsock socket only |
@@ -559,7 +560,8 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - delayed revocation;
   - workers that write after they finish;
   - every VM on CID 3;
-  - yard-node's watchdog stopping a VM whose lease lapsed.
+  - yard-node's watchdog stopping a VM whose lease lapsed;
+  - yard-node restarting: its VMs die with it, and start requests already in flight can still arrive.
 - **Properties:**
   - `oneLive`;
   - `attributed`: a call is charged to its worker's attempt;
@@ -571,7 +573,9 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - `bindByCid`;
   - `unreachableIsStopped`;
   - `endBeforeRevoke`;
-  - `captureFromUnstopped`.
+  - `captureFromUnstopped`;
+  - `tombstoneVolatile`: yard-node's tombstones do not survive its restart. Added after yard-node's hegel-go test
+    found exactly this in the code (a tombstone written under an id its recovery did not reload).
 - **Assumes:** yard-ctl's store survives, so its restart is a stutter, and the broker applies revocations it
   receives (its crashes are `broker.qnt`'s).
 
@@ -622,7 +626,7 @@ Revision 2 does not rely on it.
 **Results** (quint 0.32, seed 0x5eed, 10,000 samples × 40 steps; `spec/agentop/results.txt`):
 - **The designs hold:** `bdesign`, `edesign`, and `adesign` in all three approval configurations. Revision 1's
   model holds in its three as well.
-- **Each mutant breaks the property it names:** 7 in the broker, 5 in the executor, 2 in the clock, 8 in apply, and revision 1's 7.
+- **Each mutant breaks the property it names:** 7 in the broker, 6 in the executor, 2 in the clock, 8 in apply, and revision 1's 7.
 - **Every witness is reached:**
   - concurrent calls in flight;
   - a bounded report and an exact one;

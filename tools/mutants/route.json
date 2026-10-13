@@ -1,0 +1,18 @@
+{
+ "package": "./internal/agentroute/",
+ "notes": "tools/route-mutants.sh holds the first six; these are added after the AG2 live probe.",
+ "mutants": [
+  {
+   "name": "callIDsRestart",
+   "file": "internal/agentroute/route.go",
+   "old": "id := fmt.Sprintf(\"%s.%s.%d\", s.cfg.Alloc, s.epoch, s.n)",
+   "new": "id := fmt.Sprintf(\"%s.%d\", s.cfg.Alloc, s.n)"
+  },
+  {
+   "name": "internalErrorIsAuth",
+   "file": "internal/agentroute/route.go",
+   "old": "apiError(w, 529, \"overloaded_error\", \"yard: \"+err.Error())\n\t\treturn\n\t}\n\treq[\"max_tokens\"]",
+   "new": "apiError(w, 403, \"permission_error\", \"yard: \"+err.Error())\n\t\treturn\n\t}\n\treq[\"max_tokens\"]"
+  }
+ ]
+}

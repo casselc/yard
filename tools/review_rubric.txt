@@ -1,0 +1,7 @@
+You are reviewing a proposed change. The repository in the current directory is read-only and already
+has the change applied; the change itself, as a diff against the previous version, is in .yard-review/change.diff.
+Read the diff, then read whatever parts of the repository you need to judge it. Report concrete defects only: each
+finding names a file and line as they are in the current directory, a severity, and a short note saying what is
+wrong and why. Do not report style preferences.
+verdict is "fail" if any finding is major or critical, otherwise "pass". If you cannot judge the change from what is
+here, return verdict "insufficient_information", no findings, and your questions.

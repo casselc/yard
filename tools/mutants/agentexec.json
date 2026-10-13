@@ -1,0 +1,87 @@
+{
+ "package": "./internal/agentexec/",
+ "notes": "Run with PATH including /usr/sbin (mkfs.ext4). endBeforeRevoke (no revoke and no ledger end in end()) is equivalent here: capture stops and reaps the worker first (F5) and fence() revokes a fenced worker's scope, so nothing can use the route by then; removing either revoke alone is covered by the other (end() revokes within a tick of a fence); scopeNeverRevoked removes both.",
+ "mutants": [
+  {
+   "name": "unreachableIsStopped",
+   "file": "internal/agentexec/exec.go",
+   "old": "p.Outcome, p.Execution, p.Why, p.Allocation, p.Reallocs = \"worker_failed\", \"unconfirmed\", why, r.Alloc, r.Reallocs",
+   "new": "p.Outcome, p.Execution, p.Why, p.Allocation, p.Reallocs = \"worker_failed\", \"stopped\", why, r.Alloc, r.Reallocs"
+  },
+  {
+   "name": "restartStartsAgain",
+   "file": "internal/agentexec/exec.go",
+   "old": "\t\t\tif _, terr := e.cfg.Node.Tombstone(e.ctx, r.Alloc); terr != nil {\n\t\t\t\tcontinue\n\t\t\t}",
+   "new": "\t\t\tif false {\n\t\t\t\tcontinue\n\t\t\t}"
+  },
+  {
+   "name": "captureFromUnstopped",
+   "file": "internal/agentexec/exec.go",
+   "old": "\tst, err := e.cfg.Node.Stop(e.ctx, r.Alloc)\n\tif err != nil {\n\t\treturn e.fence(r, \"stop: node unreachable\")\n\t}",
+   "new": "\tst, err := e.cfg.Node.Get(e.ctx, r.Alloc)\n\tif err != nil {\n\t\treturn e.fence(r, \"stop: node unreachable\")\n\t}\n\tst.State = \"exited\""
+  },
+  {
+   "name": "noFenceCorrection",
+   "file": "internal/agentexec/exec.go",
+   "old": "\t\t\t\te.cfg.Store.AppendCorrection(e.ctx, r.Key, \"execution_stopped\",",
+   "new": "\t\t\t\t_ = e.cfg.Store.AppendCorrection\n\t\t\t\t_ = fmt.Sprint(\"execution_stopped\","
+  },
+  {
+   "name": "ackReleasesArtifacts",
+   "file": "internal/agentexec/api.go",
+   "old": "\t\t\te.cfg.Store.ReleaseHolder(ctx, \"op:\"+k.String())",
+   "new": "\t\t\te.cfg.Store.DB().ExecContext(ctx, `DELETE FROM leases`)"
+  },
+  {
+   "name": "unknownAsNeverAccepted",
+   "file": "internal/agentexec/api.go",
+   "old": "\t\treply(w, 200, map[string]any{\"operation_id\": k.Op, \"attempt\": k.Attempt, \"status\": \"unknown\"})",
+   "new": "\t\treply(w, 200, map[string]any{\"operation_id\": k.Op, \"attempt\": k.Attempt, \"status\": \"never_accepted\"})"
+  },
+  {
+   "name": "noDigestConflict",
+   "file": "internal/agentexec/api.go",
+   "old": "\t\tif rec.Digest != digest {\n\t\t\treply(w, 409, map[string]any{\"error\": \"conflict: another submit holds this attempt\", \"status\": rec.Status})\n\t\t\treturn\n\t\t}",
+   "new": ""
+  },
+  {
+   "name": "closedBeforeDeadline",
+   "file": "internal/agentexec/api.go",
+   "old": "\t\tif e.now() > notAfter {\n\t\t\tst = \"closed\"\n\t\t}",
+   "new": "\t\tst = \"closed\""
+  },
+  {
+   "name": "timeLimitIgnored",
+   "file": "internal/agentexec/exec.go",
+   "old": "\t\t\tcase e.now() > deadline:",
+   "new": "\t\t\tcase false && e.now() > deadline:"
+  },
+  {
+   "name": "gcIgnoresLeases",
+   "file": "internal/agentexec/artifacts.go",
+   "old": "\t  AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.artifact = a.id AND l.until >= ?)`, now, now)",
+   "new": "\t  AND ? = ?`, now, now)"
+  },
+  {
+   "name": "scopeNeverRevoked",
+   "edits": [
+    {
+     "file": "internal/agentexec/exec.go",
+     "old": "func (e *Exec) fence(r *Rec, why string) error {\n\tex := e.revokeRoute(r)",
+     "new": "func (e *Exec) fence(r *Rec, why string) error {\n\tex := \"\""
+    },
+    {
+     "file": "internal/agentexec/exec.go",
+     "old": "\tif ex := e.revokeRoute(r); ex != \"\" {\n\t\tp := readPartial(*r)\n\t\tp.Exhausted = ex\n\t\tr.setPartial(p)\n\t}\n\t_ = e.cfg.Ledger.End(e.ctx, r.Key.String())",
+     "new": "\t_ = e.revokeRoute"
+    }
+   ]
+  },
+  {
+   "name": "nodeCallsUnbounded",
+   "file": "internal/agentexec/exec.go",
+   "old": "\treturn context.WithTimeout(parent, d)\n",
+   "new": "\t_ = d\n\treturn context.WithCancel(parent)\n"
+  }
+ ]
+}

@@ -1,0 +1,41 @@
+{
+ "package": "./internal/node/",
+ "mutants": [
+  {
+   "name": "startIgnoresTombstone",
+   "file": "internal/node/node.go",
+   "old": "\t\tif a.State.State == \"tombstoned\" {\n\t\t\treturn a.State, errTombstoned\n\t\t}",
+   "new": "\t\tif false {\n\t\t\treturn a.State, errTombstoned\n\t\t}"
+  },
+  {
+   "name": "recoveryForgetsTombstones",
+   "file": "internal/node/node.go",
+   "old": "\t\tif st.State == \"running\" { // it died with the previous node process",
+   "new": "\t\tif st.State == \"tombstoned\" {\n\t\t\tcontinue\n\t\t}\n\t\tif st.State == \"running\" { // it died with the previous node process"
+  },
+  {
+   "name": "recoveryKeepsRunning",
+   "file": "internal/node/node.go",
+   "old": "\t\t\tst.State, st.Exit, st.EndMs = \"exited\", \"node_restart\", n.now().UnixMilli()",
+   "new": "\t\t\tst.Exit = \"node_restart\""
+  },
+  {
+   "name": "noWatchdog",
+   "file": "internal/node/node.go",
+   "old": "if a.State.State == \"running\" && !a.lease.IsZero() && n.now().After(a.lease) {",
+   "new": "if a.State.State == \"running\" && false {"
+  },
+  {
+   "name": "tombstoneAbsentNotSaved",
+   "file": "internal/node/node.go",
+   "old": "\t\tn.alloc[id] = a\n\t\tn.save(a)\n\t\tn.mu.Unlock()\n\t\treturn a.State, nil",
+   "new": "\t\tn.alloc[id] = a\n\t\tn.mu.Unlock()\n\t\treturn a.State, nil"
+  },
+  {
+   "name": "noIDCheck",
+   "file": "internal/node/node.go",
+   "old": "\tif !idRe.MatchString(id) { // recovery reloads only valid ids",
+   "new": "\tif false { // recovery reloads only valid ids"
+  }
+ ]
+}
