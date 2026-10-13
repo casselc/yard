@@ -5,6 +5,7 @@
 #
 #   broker_modes.qnt     the broker's accounting: concurrent reservations, lost answers, crashes, valuation, limits
 #   executor_modes.qnt   yard-ctl's recovery: ambiguous start and stop, fencing by allocation, delayed revocation
+#   clock_modes.qnt      Yard-Time, the deadline clock, across yard-ctl restarts (incarnation kept)
 #   apply_modes.qnt      candidates, artifact leases, approvals and the compare-and-set apply
 #   agentop_modes.qnt    revision 1's model, kept as evidence under its assumptions (atomic calls of known cost,
 #                        a VM whose liveness yard-node always knows, a broker that never crashes, approval inside
@@ -37,7 +38,13 @@ sim $B dropUnanswered     accounted     VIOLATED
 sim $B valuationFromGraph withinMoney   VIOLATED
 sim $B moneyOnly          withinTokens  VIOLATED
 sim $B claimExact         exactIsExact  VIOLATED
-wit $B bdesign wConcurrent wBounded wExact wResolvedLocal wCrashThenServed wLimitRefused
+sim $B awaitExactLocal    neverStuck    VIOLATED
+wit $B bdesign wConcurrent wBounded wExact wResolvedLocal wCrashThenServed wLimitRefused wLocalBounded
+C=clock_modes.qnt
+sim $C cdesign       safety   ok
+sim $C processClock  runsOnce VIOLATED
+sim $C ceilingBehind runsOnce VIOLATED
+wit $C cdesign wNearDeadlineRestart wPrunedThenRefused wAccepted
 E=executor_modes.qnt
 sim $E edesign              safety            ok
 sim $E restartStartsAgain   oneLive           VIOLATED

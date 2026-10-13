@@ -1,6 +1,6 @@
-# Agent operations: Cordis delegating to coding agents through yard (draft, revision 2.1, 2026-10-13)
+# Agent operations: Cordis delegating to coding agents through yard (draft, revision 2.2, 2026-10-13)
 
-Status: **draft, revision 2.1**. This is yard's half; Cordis RFC 0008 (revision 3, `casselc/jolt-sim`) is Cordis's
+Status: **draft, revision 2.2**. This is yard's half; Cordis RFC 0008 (revision 3, `casselc/jolt-sim`) is Cordis's
 half, and the two use one vocabulary. It extends Cordis RFC 0007
 ("Boundaries, and the inference operation contract") from inference to coding agents.
 - The sandbox choice is `design/SANDBOX-LINUX.md`.
@@ -88,6 +88,22 @@ Revision 1 added `failed` and `needs_input` to the envelope's statuses. Revision
 **The incarnation.** It is yard-ctl's durable store epoch. A yard-ctl restart keeps it. Losing the store changes
 it, and then RFC 0007's `unknown` applies.
 
+**Yard-Time, the deadline clock.** Halo's deadlines are in its monotonic clock, which resets only together with
+its incarnation, so a reset clock always comes with an incarnation that refuses every old copy. Yard keeps its
+incarnation across a restart, so it cannot use the process clock. Deadlines (`not_after`) and every `Yard-Time`
+header are in a **persistent logical clock** instead:
+- **It never repeats or goes backwards.** yard-ctl persists a **ceiling**, durably, ahead of the times it hands
+  out (10 s ahead), and advances it before Yard-Time would pass it.
+- **After a restart it resumes at the ceiling.** Real time that passed since the ceiling was written (by the wall
+  clock) is added when that is positive, and never subtracted. A clock that steps backwards only pauses Yard-Time,
+  which delays expiry and never brings it early.
+- **Tombstones stay safe.** A record or tombstone is pruned only when Yard-Time is past its `not_after` and its
+  outcome is acknowledged. Since Yard-Time never returns to a time it handed out, a late copy of a pruned attempt is
+  always refused as late. It is never accepted again.
+
+`spec/agentop/clock.qnt` models this, with a restart close to the deadline. AG2 tests a restart just before a
+deadline, and just after it.
+
 That is **not the only uncertainty**. Uncertain cost (section 6) and uncertain execution (section 5) are
 reported inside known outcomes.
 
@@ -99,14 +115,21 @@ its copy (RFC 0007). The reasons:
 - `not_permitted`: the cell, agent, route or limits exceed the runner configuration;
 - `invalid_task`;
 - `valuation_changed` (409);
-- `limits_missing`: tokens, money and time are each required;
+- `limits_missing`: tokens, charge, money and seconds are each required;
 - `input_unavailable`.
+
+A refusal closes **that copy**, not the attempt. `never_accepted` means "not accepted yet": a delayed copy of the
+submit may still arrive and be accepted before the deadline. Only an authoritative terminal answer releases the
+attempt's identity and its reservation:
+- `done`;
+- `cancelled_before_accept`, an acknowledged cancellation;
+- `closed`, the deadline passed in Yard-Time.
 
 **An accepted attempt ends in a typed terminal outcome.** Every one of them can have cost something:
 
 | Outcome | Meaning |
 |---|---|
-| `completed` | The harness finished and its output **passed structural validation** against the task's schema. The value (the findings) is carried in the receipt itself, so acceptance never depends on an artifact lease |
+| `completed` | The harness finished and its output **passed structural validation** against the task's schema. The value (the findings) is carried in the receipt itself, so guards that examine only the findings do not depend on artifact leases. Acceptance that checks the transcript or other evidence needs those artifacts held (section 8) |
 | `insufficient` | The harness finished and said it cannot do the task with what it has; its questions are data (no resumption, section 12) |
 | `invalid_output` | The harness finished; its output failed structural validation. **The raw output and the errors are kept** |
 | `budget_exhausted` | The broker refused a call at a limit (`tokens` or `money`), and the harness stopped |
@@ -118,17 +141,54 @@ Every terminal outcome carries the same three fields:
 - **`execution`:**
   - `stopped` means yard-node confirmed that the worker's process is gone.
   - `unconfirmed` means the worker could not be confirmed stopped (it was fenced, section 5). Its broker access is
-    revoked and its result is not captured. A later fact upgrades it to `stopped` when yard-node confirms.
-- **`usage`:** for each dimension (tokens, money in integer µUSD, wall seconds), `confirmed` plus `unresolved_max`,
-  and the pinned valuation.
-- **`spend`:** `{ certainty, charge }`, the charge in integer µUSD (confirmed plus unresolved maxima, at the pinned
-  valuation):
-  - `exact`: every model call's usage was confirmed by its answer.
-  - `bounded`: at least one call was unanswered. It is charged at its reserved maximum, so the true cost is at most
+    revoked and its result is not captured. If yard-node later confirms that the worker stopped, yard appends an
+    **execution correction** (below). The receipt itself never changes.
+- **`spend`:** the one charge representation (wire fields below).
+  - `exact`: every model call's usage was confirmed, by its answer or by halo's record.
+  - `bounded`: at least one call is unresolved. It is charged at its reserved maximum, so the true cost is at most
     the charge.
 
+**The spend object**, the one representation the adapter reads. Every amount is an integer, and every pair is
+`{ "confirmed": n, "unresolved_max": n }`, whose sum is what is charged:
+
+```
+"spend": {
+  "valuation":   "<price table digest>",
+  "certainty":   "exact" | "bounded",
+  "charge":      { "confirmed": n, "unresolved_max": n },   // valuation units: what Cordis settles
+  "money_micro_usd": { "confirmed": n, "unresolved_max": n }, // actual financial cost (provider routes only)
+  "tokens": {
+    "input":       { ... },   // prompt tokens not read from a cache
+    "cache_read":  { ... },   // prompt tokens served from a cache (halo's prefix cache, the provider's cache)
+    "cache_write": { ... },   // prompt tokens written to a provider cache
+    "output":      { ... }
+  },
+  "engine_ms":   n,           // halo engine time, reported for observability, not charged
+  "wall_s":      n
+}
+```
+
+**What is counted:**
+- **The token limit** counts all four classes. A cached token is processed context too, and it bounds the work.
+- **`charge`** is each call's tokens times its class price under the pinned valuation, rounded up per call, then
+  summed.
+- **Engine time is not charged** in this revision. A valuation that later prices it must add it to `charge` and to
+  the reservation's maximum together.
+- **`money_micro_usd`** is non-zero only for provider routes.
+
+**Execution corrections.** A receipt, once captured and acknowledged, is immutable. Later evidence about an attempt
+is **appended** instead:
+- `GET /v1/yard/corrections?after=<seq>` is an append-only log, with a sequence number per entry and retention
+  like a record's;
+- an entry is `{ seq, owner, operation_id, attempt, kind, evidence, at }`;
+- the kind is `execution_stopped` for now. A later spend reconciliation (open question 2) would be another kind.
+
+Cordis reads the log after its last sequence number and records each entry as a fact beside the receipt. It never
+rewrites the receipt.
+
 **The outcome is final, and `done` is reported, only after** the worker is stopped or fenced, the broker has
-confirmed the scope revoked, and the local route's unresolved calls have been resolved (section 6). If the broker
+confirmed the scope revoked, and each unresolved local call has either been resolved from halo's record or found
+unresolvable (section 6). The report never waits for exactness. If the broker
 cannot be reached to revoke, the operation stays `running`, marked `degraded`, and its reservation holds. At the
 operation's deadline it is `unknown`, settled at the whole reservation.
 
@@ -190,7 +250,7 @@ external happens, never reused. Everything about that worker is keyed by it:
   - yard-ctl revokes the allocation's scope and owes yard-node a tombstone;
   - the attempt ends `worker_failed` with execution `unconfirmed`;
   - the VM's memory and CPU stay counted against capacity until yard-node confirms it gone. On reconnect, yard-node
-    kills it, and a fact upgrades the execution to `stopped`.
+    kills it, and yard appends an `execution_stopped` correction (section 4). The receipt is unchanged.
 - **F5.** Nothing is captured from a worker that is not confirmed stopped, or from an allocation that is not the
   attempt's current one. A late finish message from a fenced allocation is kept as evidence and never becomes the
   result.
@@ -206,8 +266,11 @@ cannot be stopped because its node is unreachable is fenced (F4), and the watchd
 
 ## 6. The broker: valuation, limits and reservations
 
-**Valuation is the operator's.** A valuation is a versioned price table, in integer µUSD per token class per
-route; the local route is priced 0 unless the operator says otherwise. It lives in the runner configuration with
+**Valuation is the operator's.** A valuation is a versioned price table, in integer **valuation units** per token
+class per route:
+- On a provider route, one unit is one µUSD of actual cost. The charge equals the money spent.
+- On the local route, the price is a **resource valuation**: a nominal charge for the Halo's capacity, set by the
+  operator. It is not financial spending, and `money_micro_usd` stays 0. It lives in the runner configuration with
 the broker, outside the graph and the mutation protocol.
 
 The agent (through its graph) can choose among the routes it is permitted, set limits **at or below** its
@@ -219,18 +282,18 @@ stale valuation is refused with `409 valuation_changed` (not executed), and the 
 reservation and every settlement of that attempt uses the pinned valuation. A price change applies to later attempts
 only.
 
-**Cordis's unit is the µUSD.** Yard converts tokens and route prices to µUSD once, rounding up, and Cordis reserves
-the task's `micro_usd` limit. So **the local route needs a nominal price** from the operator (per token, or per
-engine second). Without one, a local review reserves nothing in Cordis's budget, and only yard's token limit bounds
-it.
+**Cordis budgets in valuation units.** It reserves the task's `charge` limit, and settles at `spend.charge`.
+Because every route has a non-zero price, a local review consumes the workflow's budget like any other.
 
-**Three limits, each enforced on its own:**
-- **tokens:** all classes, counted by the broker;
-- **money:** µUSD under the pinned valuation, counted by the broker;
-- **wall time:** seconds, enforced by yard-ctl.
+**Four limits, each enforced on its own, each with a mandatory operator ceiling:**
+- **`tokens`:** all four classes, counted by the broker;
+- **`charge`:** valuation units under the pinned valuation, counted by the broker. This is Cordis's reservation;
+- **`money_micro_usd`:** actual financial spend on provider routes, counted by the broker. It is a separate cap,
+  so a cheap-looking valuation can never authorise real spending past it;
+- **`seconds`:** wall time, enforced by yard-ctl.
 
-The token limit bounds the local route on its own, whatever its nominal price. The operator's ceiling for every
-limit is mandatory.
+`broker.qnt`'s money dimension stands for any priced dimension: `charge` and `money_micro_usd` are both enforced as
+it is.
 
 **Reserve, send, settle.** The ledger is SQLite (WAL, synchronous=FULL), one row per model call.
 
@@ -262,11 +325,19 @@ limit is mandatory.
   bounds the token count for a byte-level tokenizer. AG6 verifies that bound against the provider's counts before
   any money limit relies on it.
 
-**The local route resolves its lost answers.** The broker submits each local call to Halo as an **RFC 0007
-operation**, with the call's ledger id as the operation id. It relays the operation's observation stream to the
-harness as the Messages stream. A lost connection or a broker crash is then resolved by Halo's status and result:
-Halo keeps the usage until the broker acknowledges, which it does after committing the settlement. So local calls
-end `exact`.
+**The local route resolves its lost answers, while Halo keeps them.** The broker submits each local call to Halo as
+an **RFC 0007 operation**, with the call's ledger id as the operation id. It relays the operation's observation
+stream to the harness as the Messages stream. After a lost connection or a broker crash, Halo's status and result
+answer it: Halo keeps the usage until the broker acknowledges, which it does after committing the settlement.
+
+**Halo's records are not durable.** They live as long as its incarnation, so a lost local call is unresolvable when:
+- Halo restarted before the broker captured the usage (a new incarnation: the old operation is `unknown`);
+- the operation's deadline passed;
+- Halo says `never_accepted` and the deadline has passed.
+
+The call then **keeps its reserved maximum**, as a provider call does, and the attempt is `bounded`. A local review
+can therefore end `bounded`. The broker never waits for exactness: once nothing is in flight, the attempt reports
+with what it has (`broker.qnt`'s `neverStuck`; mutant `awaitExactLocal`).
 
 A provider call that lost its answer stays `unresolved`, and the attempt is `bounded`. Reconciling against the
 provider's usage reports later is open question 2.
@@ -462,18 +533,21 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - a provider that serves a call whether or not its answer returns;
   - lost answers;
   - two broker crashes;
-  - local calls resolved from Halo's operation record.
+  - local calls resolved from Halo's operation record;
+  - Halo restarting during the broker's reconciliation, which loses those records.
 - **Properties:**
   - `accounted`: real spend ≤ what the ledger holds, per dimension;
   - `withinTokens` and `withinMoney`: real spend within each limit, on its own;
-  - `exactIsExact`.
+  - `exactIsExact`;
+  - `neverStuck`: an ended attempt with nothing in flight can always report.
 - **Mutants:**
   - `checkConfirmedOnly`: admission ignores open reservations;
   - `volatileReserve`: the reservation is not durable before the send;
   - `dropUnanswered`;
   - `valuationFromGraph`: the agent zeroed the price;
   - `moneyOnly`: no separate token limit;
-  - `claimExact`.
+  - `claimExact`;
+  - `awaitExactLocal`: the report waits for local calls to become exact, and stays stuck once Halo has lost them.
 - **Assumes:** a call's real cost never exceeds its reserved maximum, which is the input bound's correctness.
   AG6 verifies that for the provider.
 
@@ -500,6 +574,19 @@ The models are sampled with `quint run` (`spec/agentop/run.sh`), never model-che
   - `captureFromUnstopped`.
 - **Assumes:** yard-ctl's store survives, so its restart is a stutter, and the broker applies revocations it
   receives (its crashes are `broker.qnt`'s).
+
+**`clock.qnt`: Yard-Time across yard-ctl restarts.**
+- **Modelled:**
+  - one attempt with a deadline;
+  - copies of its submit arriving at any time, late ones included;
+  - its record pruned once past the deadline and acknowledged;
+  - two restarts that keep the incarnation, one of them close to the deadline.
+- **Properties:**
+  - `runsOnce`;
+  - `monotone`: Yard-Time never goes back below a time it handed out.
+- **Mutants:**
+  - `processClock`: a restart resumes at the process clock's zero;
+  - `ceilingBehind`: the persisted ceiling lags the times handed out.
 
 **`apply.qnt`: candidates, leases, approvals and apply.**
 - **Modelled:**
@@ -535,16 +622,17 @@ Revision 2 does not rely on it.
 **Results** (quint 0.32, seed 0x5eed, 10,000 samples × 40 steps; `spec/agentop/results.txt`):
 - **The designs hold:** `bdesign`, `edesign`, and `adesign` in all three approval configurations. Revision 1's
   model holds in its three as well.
-- **Each mutant breaks the property it names:** 6 in the broker, 5 in the executor, 8 in apply, and revision 1's 7.
+- **Each mutant breaks the property it names:** 7 in the broker, 5 in the executor, 2 in the clock, 8 in apply, and revision 1's 7.
 - **Every witness is reached:**
   - concurrent calls in flight;
   - a bounded report and an exact one;
-  - a local call resolved after a lost answer;
+  - a local call resolved after a lost answer, and a local review ending `bounded` after a Halo restart;
+  - a yard-ctl restart near the deadline, and a pruned attempt's late copy refused;
   - a provider serving after a broker crash;
   - a limit refusal;
   - a lost worker confirmed stopped;
   - a fenced worker still running whose calls are refused;
-  - a fenced execution upgraded to stopped;
+  - a fenced worker later confirmed stopped;
   - a re-allocation that completed;
   - a pending revocation;
   - a watchdog stopping a fenced worker;
@@ -559,7 +647,7 @@ Deep runs and a second seed are in `results.txt`.
 |---|---|---|
 | **AG0** | This revision and the models | The designs hold; each mutant breaks its property; every witness is reached |
 | **AG1** (Y1a) | The review task by hand on the Halo: the harness image (the P0-2 guest plus Node, Claude Code, ripgrep, git); the claude driver; input images per commit; the broker's ledger with reservations and the local route through Halo operations | The section 9 review runs in a VM against a fixture repository and returns a valid `Review`. Section 10's measurements are recorded. Disallowed tools are refused (verified in the transcript) |
-| **AG2** (Y1a) | yard-ctl serves the envelope for `api: "agent"`: stages, allocations, fencing, outcomes with certainty, artifacts with leases | The fault probe passes at every stage: a lost start answer; a late start (a stale allocation); yard-node unreachable (SIGSTOP), then back; the watchdog's lease expiry; a killed VM; a yard-ctl restart at every stage; a cancel at every stage; a broker crash between reserve and send, and mid-call; a lost model answer; a delayed revocation; an artifact read after its lease. Every outcome's certainty is true to the injected fault |
+| **AG2** (Y1a) | yard-ctl serves the envelope for `api: "agent"`: stages, allocations, fencing, outcomes with certainty, artifacts with leases | The fault probe passes at every stage: a lost start answer; a late start (a stale allocation); yard-node unreachable (SIGSTOP), then back; the watchdog's lease expiry; a killed VM; a yard-ctl restart at every stage; a cancel at every stage; a broker crash between reserve and send, and mid-call; a lost model answer; a Halo restart while the broker reconciles (the attempt ends `bounded`, never stuck); a yard-ctl restart just before and just after a deadline; a delayed revocation; an artifact read after its lease. Every outcome's certainty is true to the injected fault |
 | **AG3** (Y1b) | Cordis: the envelope with a yard adapter; `agent.run` and the review cell (RFC 0008) | **The first deliverable:** a Cordis review workflow with the review cell, through the milestone's faults, with the evidence manifest |
 | **AG4** | Writers: read-write clones, the differ VM, candidates | An implementer task returns a candidate whose diff shows modes, symlinks and deletions; the policy refusals fire on crafted trees |
 | **AG5** | Approvals and apply | Approve then apply; deny, expire, withdrawn authority and a moved base each refuse; apply after the operation's acknowledgement still finds the candidate |
@@ -571,8 +659,7 @@ Deep runs and a second seed are in `results.txt`.
 
 ## 17. Open questions
 
-1. **The local route's nominal price** (per token or per engine second), which the operator sets so a local
-   review has a Cordis budget (section 6).
+1. **The local route's resource valuation rates** per token class, which the operator sets (section 6).
 2. **Reconciling bounded provider charges.** The provider's usage reports could later lower a `bounded` charge, as
    an explicit correction fact. Or the bound stands. The draft proposes that the bound stands until AG6 shows how
    often answers are lost.
@@ -621,3 +708,22 @@ Deep runs and a second seed are in `results.txt`.
     - the approval decision arriving as an input;
     - their fault list.
   - It keeps the per-allocation host socket in place of CID and tap attestation, and stop-before-capture.
+- **Revision 2.2 (2026-10-13)** answers the second review:
+  1. **Halo's records die with its incarnation.** A local call becomes unresolvable when Halo restarts before the
+     broker captured it. It keeps its maximum, so a local review can end `bounded`, and the report never waits for
+     exactness. `broker.qnt` models the Halo restart (mutant `awaitExactLocal`).
+  2. **Refusals and `never_accepted` don't release the attempt.** A refusal closes only its copy, and
+     `never_accepted` is not terminal. Only `done`, an acknowledged cancellation or `closed` releases the
+     attempt's identity and reservation (section 4).
+  3. **Yard-Time is a persistent logical clock** with a durable ceiling. It never goes backwards across a restart
+     that keeps the incarnation, so tombstones are never pruned early or re-accepted. `clock.qnt` models it.
+  4. **Pricing:**
+     - charges are in valuation units, with a resource valuation for the local route (not financial spend);
+     - there are four limits, `tokens`, `charge`, `money_micro_usd` and `seconds`;
+     - Cordis reserves `charge`.
+  5. **One spend object** on the wire, with token classes, how cached tokens count, and engine time reported but
+     not charged.
+  6. **Corrections:** the receipt is immutable. Later execution evidence is appended to a corrections log that Cordis
+     reads.
+  7. **Acceptance and leases:** acceptance that needs the transcript or other evidence depends on those artifacts'
+     leases.

@@ -6,12 +6,20 @@ sim   broker               dropUnanswered             accounted                V
 sim   broker               valuationFromGraph         withinMoney              VIOLATED (expect VIOLATED)
 sim   broker               moneyOnly                  withinTokens             VIOLATED (expect VIOLATED)
 sim   broker               claimExact                 exactIsExact             VIOLATED (expect VIOLATED)
-wit   broker bdesign wConcurrent was witnessed in 453 trace(s) out of 10000 explored (4.53%)
-wit   broker bdesign wBounded was witnessed in 4483 trace(s) out of 10000 explored (44.83%)
-wit   broker bdesign wExact was witnessed in 494 trace(s) out of 10000 explored (4.94%)
-wit   broker bdesign wResolvedLocal was witnessed in 1867 trace(s) out of 10000 explored (18.67%)
-wit   broker bdesign wCrashThenServed was witnessed in 2851 trace(s) out of 10000 explored (28.51%)
-wit   broker bdesign wLimitRefused was witnessed in 1090 trace(s) out of 10000 explored (10.90%)
+sim   broker               awaitExactLocal            neverStuck               VIOLATED (expect VIOLATED)
+wit   broker bdesign wConcurrent was witnessed in 471 trace(s) out of 10000 explored (4.71%)
+wit   broker bdesign wBounded was witnessed in 4573 trace(s) out of 10000 explored (45.73%)
+wit   broker bdesign wExact was witnessed in 321 trace(s) out of 10000 explored (3.21%)
+wit   broker bdesign wResolvedLocal was witnessed in 999 trace(s) out of 10000 explored (9.99%)
+wit   broker bdesign wCrashThenServed was witnessed in 2422 trace(s) out of 10000 explored (24.22%)
+wit   broker bdesign wLimitRefused was witnessed in 1072 trace(s) out of 10000 explored (10.72%)
+wit   broker bdesign wLocalBounded was witnessed in 978 trace(s) out of 10000 explored (9.78%)
+sim   clock                cdesign                    safety                   ok       (expect ok)
+sim   clock                processClock               runsOnce                 VIOLATED (expect VIOLATED)
+sim   clock                ceilingBehind              runsOnce                 VIOLATED (expect VIOLATED)
+wit   clock cdesign wNearDeadlineRestart was witnessed in 7419 trace(s) out of 10000 explored (74.19%)
+wit   clock cdesign wPrunedThenRefused was witnessed in 8389 trace(s) out of 10000 explored (83.89%)
+wit   clock cdesign wAccepted was witnessed in 8389 trace(s) out of 10000 explored (83.89%)
 sim   executor             edesign                    safety                   ok       (expect ok)
 sim   executor             restartStartsAgain         oneLive                  VIOLATED (expect VIOLATED)
 sim   executor             bindByCid                  attributed               VIOLATED (expect VIOLATED)
@@ -63,5 +71,5 @@ wit   agentop design wConflict was witnessed in 685 trace(s) out of 10000 explor
 wit   agentop design wDenied was witnessed in 2299 trace(s) out of 10000 explored (22.99%)
 wit   agentop autoConfigured wAutoApplied was witnessed in 2778 trace(s) out of 10000 explored (27.78%)
 failures: 0
-deep (100000 x 80) edesign: [ok] No violation found (35929ms at 2783 traces/second).
-deep (100000 x 80) adesign: [ok] No violation found (66429ms at 1505 traces/second).
+deep (100000 x 80) bdesign: [ok] No violation found (14628ms at 6836 traces/second).
+deep (100000 x 80) cdesign: [ok] No violation found (21617ms at 4626 traces/second).

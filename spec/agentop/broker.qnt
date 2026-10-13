@@ -5,8 +5,10 @@
 // concurrently. A call is reserved at its maximum cost before it is sent; the provider may serve it whether or not
 // its answer comes back; the broker may crash with calls in flight. What the attempt is charged is what the
 // broker's durable ledger holds: an answered call at its confirmed usage, an unanswered one at its reserved
-// maximum. A call on the local (halo) route that lost its answer is resolvable later, because halo keeps the
-// operation's usage until it is acknowledged; one on the provider route stays at its maximum.
+// maximum. A call on the local (halo) route that lost its answer is resolvable later from halo's operation record,
+// which keeps the usage until acknowledged, but only while halo keeps its incarnation: halo's records are not
+// durable, and a halo restart before the broker captured the usage makes the call unresolvable. It then stays at
+// its maximum, as a provider call does, and the attempt is reported bounded rather than waiting for exactness.
 //
 // Rules (RULES; one mutant each in broker_modes.qnt):
 //  atomic    a call is admitted only if every open reservation, every charge and its own maximum fit each limit
@@ -15,8 +17,9 @@
 //  pinned    the valuation is the operator's, pinned for the attempt (never the graph's, which the agent can edit)
 //  tokens    the token limit is enforced on its own, not only through money
 //  honest    the final report says exact only when no call is unresolved
+//  settle    the final report does not wait for an unresolved local call to become exact (halo may have lost it)
 module broker {
-  type Rules = { atomic: bool, durable: bool, hold: bool, pinned: bool, tokens: bool, honest: bool }
+  type Rules = { atomic: bool, durable: bool, hold: bool, pinned: bool, tokens: bool, honest: bool, settle: bool }
   const RULES: Rules
 
   pure val NC = 3              // calls the harness makes (each once)
@@ -30,19 +33,20 @@ module broker {
   // Unresolved: no answer (lost, or the broker crashed); charged at its maximum until resolved.
   type CSt = Free | Reserved | Sent | Answered | Unresolved
   // known: the broker's ledger has the row. durable: it would survive a crash. sent: it left the broker
+  // gone: halo restarted after the call reached it; its operation record (and the usage in it) is lost
   type Call = { st: CSt, route: Route, maxT: int, maxM: int, sent: bool, served: bool, realT: int, realM: int,
-                known: bool, durable: bool }
+                known: bool, durable: bool, gone: bool }
   type Cert = Open | Exact | Bounded
   type S = {
     calls: int -> Call,
-    ended: bool, report: Cert, crashes: int, resolved: int, refusals: int,
+    ended: bool, report: Cert, crashes: int, resolved: int, refusals: int, haloRestarts: int,
     reportedExactWrongly: bool,
   }
   var s: S
 
   pure val C0: Call = { st: Free, route: Local, maxT: 0, maxM: 0, sent: false, served: false, realT: 0, realM: 0,
-                        known: false, durable: false }
-  action init = s' = { calls: CALLS.mapBy(_ => C0), ended: false, report: Open, crashes: 0, resolved: 0, refusals: 0,
+                        known: false, durable: false, gone: false }
+  action init = s' = { calls: CALLS.mapBy(_ => C0), ended: false, report: Open, crashes: 0, resolved: 0, refusals: 0, haloRestarts: 0,
                        reportedExactWrongly: false }
 
   pure def upd(st: S, i: int, c: Call): S = { ...st, calls: st.calls.set(i, c) }
@@ -108,7 +112,7 @@ module broker {
     val c = s.calls.get(i)
     val tt = if (t > c.maxT) c.maxT else t
     val price = if (c.route == Local) 0 else PRICE
-    all { c.sent, c.st != Answered, not(c.served),
+    all { c.sent, c.st != Answered, not(c.served), not(c.gone),
           s' = upd(s, i, { ...c, served: true, realT: tt, realM: tt * price }) }
   }
 
@@ -138,29 +142,43 @@ module broker {
              else c }) },
   }
 
-  // a local call that lost its answer is resolved from halo's operation record (usage kept until acked)
+  // halo restarts (a new incarnation): every local call it had and the broker has not settled loses its record;
+  // a call it had not served yet never runs. A call already served keeps its real cost
+  action haloRestart: bool = all {
+    s.haloRestarts < 2,
+    s' = { ...s, haloRestarts: s.haloRestarts + 1,
+           calls: CALLS.mapBy(i => {
+             val c = s.calls.get(i)
+             if (c.route == Local and c.sent and c.st != Answered) { ...c, gone: true } else c }) },
+  }
+
+  // a local call that lost its answer is resolved from halo's operation record, while halo still has it
   action resolveLocal: bool = {
     nondet i = CALLS.oneOf()
     val c = s.calls.get(i)
-    all { c.st == Unresolved, c.route == Local, c.served, c.known,
+    all { c.st == Unresolved, c.route == Local, c.served, c.known, not(c.gone),
           s' = { ...upd(s, i, { ...c, st: Answered }), resolved: s.resolved + 1 } }
   }
 
   // the attempt ends: no more reservations; the final report once nothing is in flight
   action end: bool = all { not(s.ended), s' = { ...s, ended: true } }
 
+  // the mutant waits until every unresolved local call is resolved exactly
+  def reportAllowed: bool =
+    RULES.settle or CALLS.forall(i => not(s.calls.get(i).st == Unresolved and s.calls.get(i).route == Local))
+  def nothingInFlight: bool = CALLS.forall(i => s.calls.get(i).st != Sent and s.calls.get(i).st != Reserved)
+
   action finalReport: bool = {
     val unresolved = CALLS.exists(i => s.calls.get(i).st == Unresolved)
     val cert = if (unresolved and RULES.honest) Bounded else Exact
     all {
-      s.ended, s.report == Open,
-      CALLS.forall(i => s.calls.get(i).st != Sent and s.calls.get(i).st != Reserved),
+      s.ended, s.report == Open, nothingInFlight, reportAllowed,
       s' = { ...s, report: cert,
              reportedExactWrongly: cert == Exact and (chargedT != realT or chargedM != realM) },
     }
   }
 
-  action step = any { reserve, refuse, send, serve, answer, lose, crash, resolveLocal, end, finalReport }
+  action step = any { reserve, refuse, send, serve, answer, lose, crash, haloRestart, resolveLocal, end, finalReport }
 
   // ---- properties -------------------------------------------------------------------------------------------
   // the ledger never holds less than what was really spent
@@ -170,13 +188,21 @@ module broker {
   val withinMoney: bool = realM <= MONLIM
   // an exact report is exact
   val exactIsExact: bool = not(s.reportedExactWrongly)
-  val safety: bool = and { accounted, withinTokens, withinMoney, exactIsExact }
+  // never stuck: an ended attempt with nothing in flight can always report, even when a local call can no longer be
+  // resolved (halo lost it)
+  val neverStuck: bool = not(and {
+    s.ended, s.report == Open, nothingInFlight, not(reportAllowed),
+    CALLS.forall(i => (s.calls.get(i).st == Unresolved and s.calls.get(i).route == Local) implies s.calls.get(i).gone),
+  })
+  val safety: bool = and { accounted, withinTokens, withinMoney, exactIsExact, neverStuck }
 
   // witnesses
   val wConcurrent: bool = CALLS.filter(i => s.calls.get(i).st == Sent).size() >= 2
   val wBounded: bool = s.report == Bounded
   val wExact: bool = s.report == Exact and CALLS.exists(i => s.calls.get(i).st == Answered)
   val wResolvedLocal: bool = s.resolved > 0
+  val wLocalBounded: bool = s.report == Bounded and s.haloRestarts > 0 and
+    CALLS.exists(i => s.calls.get(i).route == Local and s.calls.get(i).gone and s.calls.get(i).st == Unresolved)
   val wCrashThenServed: bool = s.crashes > 0 and CALLS.exists(i => s.calls.get(i).st == Unresolved and s.calls.get(i).served)
   val wLimitRefused: bool = s.refusals > 0
 }
