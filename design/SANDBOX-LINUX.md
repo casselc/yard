@@ -168,6 +168,13 @@ the boundary. Keep them on as inner layers inside A-E; they cost nothing and add
 | D CH/Kata + virtiofs | VM | no (own kernel) | ~0.3-0.5 s | yes | yes | 2-3+ weeks |
 | E NUC jail + Linuxulator | jail, other kernel, other machine | **yes** | ~ms | acceptable | no | ~1 week incl. spikes |
 
+## Decision (user, 2026-10-12)
+
+- **No bwrap or Landlock stopgap (A is out).**
+- **Firecracker (C) is the first and default backend** for agent tasks.
+- **NUC jails (E) stay on the roadmap** as a later backend.
+- Agent operations are in `design/AGENT-OPERATIONS.md`.
+
 ## Recommendation (revised 2026-10-12, after the user's question)
 
 The first version preferred the NUC for read-only tasks and the Halo for code-running tasks. That was backwards on

@@ -1,0 +1,22 @@
+quint 0.32.0, seed 0x5eed, steps 40, samples 10000
+sim   design                   safety                   ok       (expect ok)
+sim   enabledUntested          safety                   ok       (expect ok)
+sim   autoConfigured           safety                   ok       (expect ok)
+sim   brokerNoCap              withinCap                VIOLATED (expect VIOLATED)
+sim   meterFromHarness         accounted                VIOLATED (expect VIOLATED)
+sim   rerunOnRestart           runsOnce                 VIOLATED (expect VIOLATED)
+sim   scopeNotRevoked          noCallsAfterEnd          VIOLATED (expect VIOLATED)
+sim   applyWithoutApproval     noApplyWithoutApproval   VIOLATED (expect VIOLATED)
+sim   autoApproveUnconfigured  noAutoUnlessConfigured   VIOLATED (expect VIOLATED)
+sim   applyStaleBase           noLostUpdate             VIOLATED (expect VIOLATED)
+wit   design wApplied was witnessed in 4212 trace(s) out of 10000 explored (42.12%)
+wit   design wReviewSettled was witnessed in 4199 trace(s) out of 10000 explored (41.99%)
+wit   design wCapHit was witnessed in 766 trace(s) out of 10000 explored (7.66%)
+wit   design wCrashSettled was witnessed in 6999 trace(s) out of 10000 explored (69.99%)
+wit   design wRestartAdopted was witnessed in 7021 trace(s) out of 10000 explored (70.21%)
+wit   design wConflict was witnessed in 685 trace(s) out of 10000 explored (6.85%)
+wit   design wDenied was witnessed in 2299 trace(s) out of 10000 explored (22.99%)
+wit   autoConfigured wAutoApplied was witnessed in 2778 trace(s) out of 10000 explored (27.78%)
+failures: 0
+deep design: [ok] No violation found (19708ms at 5074 traces/second).
+deep autoConfigured: [ok] No violation found (19818ms at 5046 traces/second).
