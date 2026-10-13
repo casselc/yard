@@ -1,331 +1,372 @@
-# Agent operations: Cordis delegating to Claude Code, Codex and opencode through yard (draft, 2026-10-12)
+# Agent operations: Cordis delegating to coding agents through yard (draft, revision 2, 2026-10-13)
 
-Status: **draft**. Yard's half of what cordis would call RFC 0008. It extends cordis RFC 0007 ("Boundaries, and
-the inference operation contract") from inference to coding agents.
+Status: **draft**. Yard's half of cordis RFC 0008 (`casselc/jolt-sim`, `docs/cordis/rfc/0008-agent-runs.md`), which
+extends cordis RFC 0007 ("Boundaries, and the inference operation contract") from inference to coding agents.
 - The sandbox choice is `design/SANDBOX-LINUX.md`.
-- The model is `spec/agentop/`.
+- The model is `spec/agentop/`, whose results are evidence **under the assumptions listed in section 15**, not
+  proofs of this revision's protocol.
 - The private notes this draws on (HARNESS, IDENTITY, WARDEN, A2A-MCP, TRAINING-DATA) are cited by name.
 
-## 0. Decisions (user, 2026-10-12)
+## 0. Decisions
 
+User, 2026-10-12 (kept):
 1. **Models:** the local Halo model first (Claude Code against halo-flash's `/v1/messages` through the broker),
-   then the **brokered Anthropic API**. Keys stay in the broker.
-2. **Applying an agent's change always needs the user's approval.** That holds until a cordis approval harness
-   exists and is tested. Automated approval can then be enabled and configured **cell by cell**.
-3. **Sandboxes: Firecracker, with no bwrap or Landlock stopgap.**
-   - Agent tasks run in Firecracker microVMs on the Halo (yard-node; HARNESS SR2, P0-2 spike done). That is the
-     first backend and the default.
-   - **NUC jails stay on the roadmap** as a second backend behind the same executor interface: capacity, and
-     distance from the GPU box (`design/SANDBOX-LINUX.md`, option E).
+   then the brokered Anthropic API. Keys stay in the broker.
+2. **Applying an agent's change always needs the user's approval** until a cordis approval harness exists and is
+   tested; automated approval can then be enabled cell by cell.
+3. **Sandboxes: Firecracker**, no bwrap or Landlock stopgap. Agent tasks run in Firecracker microVMs on the Halo
+   (yard-node; HARNESS SR2, P0-2 spike done). NUC jails stay a second backend behind the same executor interface.
 
-## 1. What this is
+User, 2026-10-13 (this revision): the architecture is unchanged (Yard executes agents in Firecracker; the per-agent
+outbox manages durable operations; Cordis coordinates workflows; Halo supplies local inference). The scope is
+narrowed and the contract corrected:
 
-A cordis cell can hand work to a coding agent as a typed, budgeted, recoverable **operation**, as it hands a
-completion to halo:
-- "Review this diff against the repo and give me a verdict and findings."
-- "Implement this change and give me a branch."
+4. **The first deliverable is one read-only Claude review task against Halo** (section 1), reliable in authority,
+   recovery and accounting. Writers, approved apply, cloud routes, interactive continuation, native delegation,
+   and other harnesses come after it, each when its own state, budget and cancellation semantics are written
+   (section 12).
+5. **Status is separate from accounting certainty** (section 4); the broker's accounting is conservative and
+   durable (section 6); valuation is the operator's (section 5); the executor's recovery is staged and fenced
+   (section 7); artifacts have their own leases (section 8).
 
-The workflow sees a typed result and a cost, never a process, a socket or a credential.
+## 1. What this is, and the first milestone
+
+A cordis cell hands work to a coding agent as a typed, budgeted, recoverable **operation**, as it hands a
+completion to halo. The workflow sees a typed outcome and a cost, never a process, a socket or a credential.
 
 ```
-cordis cell ── effect agent.run ──► outbox (operation service) ── RFC 0007 verbs, api "agent" ──► yard-ctl
+cordis cell ── effect agent.run ──► outbox (operation envelope + yard adapter) ── RFC 0007 verbs, api "agent" ──► yard-ctl
                                                                                                   │ durable task
-                                       yard-node (Halo) ◄── start / cancel / observe ─────────────┘
-                                       └ Firecracker VM: harness driver (claude | codex | opencode | yard-agent)
-                                           └ vsock ─► broker ─► halo /v1/messages  (then Anthropic, key injected)
-                                       workspace: ZFS version → zvol clone (ro or rw) → result version
+                                       yard-node (Halo) ◄── start / stop / observe ───────────────┘
+                                       └ Firecracker VM: harness driver (claude)
+                                           └ vsock ─► broker ─► halo /v1/messages
+                                       workspace: immutable base snapshot, mounted read-only
 ```
+
+**Milestone Y1 (the one thing to deliver first).** One noninteractive Claude Code review task against Halo, with:
+- an **immutable workspace** (a base snapshot, attached read-only; nothing in the VM can change it);
+- **read and search tools only** (Read, Grep, Glob); no shell, no network, **no native subagents**;
+- **structured findings** (a typed output, validated by structure only; section 9);
+- **bounded resources**: token, monetary and wall-clock limits enforced independently, plus VM memory, CPU,
+  process and output limits;
+- **retained evidence**: the transcript, the meter rows, the stage log, the outcome, all under artifact leases;
+- **cancellation** at any stage;
+- **recovery** from yard-ctl, broker and yard-node restarts and from a lost worker, with the fault tests of
+  section 16.
+
+It is connected to Cordis (a `claude_review` cell in a review loop) only after it passes alone.
 
 ## 2. Owners
 
 | Owner | Authoritative for | Not |
 |---|---|---|
-| **cordis** (workflow) | The cell's intent, its typed result, which receipts it applied, which workspace version the workflow is on | Credentials, sandboxes, model routing |
-| **outbox** (operation service, per agent) | Attempts, reservations and settlement, receipts, the commit-before-ack handoff; the same adapter as for halo, with `api: "agent"` | What the agent did inside |
-| **yard-ctl** (executor) | The task record, durably: accepted, running, finished; the VM and workspace it used; the metered usage; the result held until acknowledged | The workflow's meaning of the result |
-| **yard-node** (Halo) | The Firecracker VM's lifecycle, the zvol clone, the vsock channel to the guest | Policy |
-| **broker** | Model routing, credential injection, **metering**, the per-task budget cap and scope | Task outcomes |
-| **workspace registry** (yard-ctl) | Workspace versions and which task produced each; `apply` | |
-| **the user** (approval page), later a **cordis approval harness** | Whether a result version may be applied | |
+| **cordis** (workflow) | The cell's intent; whether a returned value **satisfies the task** (acceptance); which outcomes it applied | Credentials, sandboxes, routing, prices |
+| **outbox** (per agent) | The operation envelope: attempt identity, the exact submission, polling, durable capture, acknowledgement; the yard adapter's reading of outcomes | What the agent did inside; valuation |
+| **yard-ctl** | The task row and its stages, durably; fencing; artifact leases; the contract and its valuation | The workflow's meaning of the result |
+| **yard-node** (Halo) | The Firecracker VM allocation: start, stop, its incarnation; the volumes | Policy |
+| **broker** | Model routing, credential injection, **reservations and metering**, scope activation and revocation | Task outcomes |
+| **operator** | The price table (valuation), permitted agents and routes, budget ceilings, who may use `ReadWrite` | |
+| **the user** (approval page), later a **cordis approval harness** | Approval of a candidate (deferred, section 12) | |
 
 ## 3. The cordis side
 
-An effect and types (cordis graph language; the names are a proposal for the cordis agent):
+Noninteractive. A task states its inputs and gets one outcome.
 
 ```
-type Workspace = { repo: str, version: str };            // a yard workspace version
-type AgentBudget = { tokens: int, usd: float, minutes: int };
+type Workspace   = { repo: str, version: str }          // a yard workspace version; immutable
+type AgentBudget = { tokens: int, micro_usd: int, seconds: int }   // three independent limits
 type AgentTask<T> = {
-  agent: Agent,                 // Claude | Codex | Opencode | YardAgent
-  model: ModelRoute,            // Local (halo) | Anthropic   (the route, never a key)
-  workspace: Workspace, mode: ReadOnly | ReadWrite,
+  agent: Agent, model: ModelRoute,                       // a permitted route, never a key
+  workspace: Workspace, mode: ReadOnly,                  // ReadWrite is deferred (section 12)
   instructions: [str],
-  output: Type<T>,              // validated by yard-ctl; a schema miss is retried once, then an error
-  budget: AgentBudget,
-};
-type AgentOutcome<T> = { value: T, result_version: Workspace | null, usage: Usage, transcript: Ref };
-
-effect agent.run<T>(AgentTask<T>) : AgentOutcome<T>;
-effect workspace.apply(Workspace /* result */, Workspace /* expected base */) : Workspace;   // needs approval
-```
-
-A review cell:
-
-```
-type Finding = { file: str, line: int, severity: Severity, note: str };
-type Review  = { verdict: Pass | Fail, findings: [Finding] };
-
-cell claude_review(diff : Diff, ws : Workspace) : Review ! { agent.run } = {
-  use r = agent.run(AgentTask{ agent: Claude, model: Local, workspace: ws, mode: ReadOnly,
-                               instructions: ['Review the change below. ...', diff.patch], output: Review,
-                               budget: { tokens: 400000, usd: 0, minutes: 15 } });
-  r.value
+  output: Type<T>,                                       // validated by structure
+  budget: AgentBudget,                                   // at or below the operator's ceiling
+  valuation: Digest,                                     // the price table the outbox priced its reservation with
 }
+type AgentResult<T> =
+  | Completed{ value: T, usage: Usage, artifacts: [Artifact] }
+  | Incomplete{ reason: Timeout | BudgetExhausted | Cancelled | InvalidOutput | WorkerFailed | Insufficient,
+                usage: Usage, spend: Spend, artifacts: [Artifact] }
 ```
 
-**Authority is the runner's configuration, never the graph's** (RFC 0007, `observe.qnt`'s `misclassify`). The
-runner config grants, per cell:
-- which agents and model routes it may use, and the maximum budget;
-- `ReadWrite`;
-- whether `workspace.apply` may be approved automatically.
+`Insufficient` is how a noninteractive agent says it cannot proceed without more information; the cell decides what
+to do (emit a new task with more, or ask a person). A **refusal** is reserved for a submission that was **not
+executed** (section 4). An `Incomplete` is a *result*: it cost something, it has a usage, and it may have partial
+artifacts.
 
-Until the approval harness exists, the last is always "no": every apply raises a card for the user.
+## 4. The agent operation: terminal outcome, execution, spend
 
-## 4. The agent operation type
+The wire is RFC 0007's: submit with incarnation, `not_after` and digest; status, fetch, cancel, ack; retention
+until ack; the record ceiling; refusals that close only their copy. `api: "agent"` adds a body, not verbs.
 
-The wire is RFC 0007's, unchanged:
-- submit with incarnation, not-after and digest;
-- status, fetch, observe, cancel, ack;
-- retention until ack, the record ceiling, refusals that close only their copy.
+A terminal answer carries three independent facts:
 
-The type declares its guarantees in yard's contract (`GET /v1/yard/contract`, the same shape as halo's):
+| Fact | Values | Meaning |
+|---|---|---|
+| **outcome** | `completed`, `invalid_output`, `insufficient`, `budget_exhausted`, `timeout`, `cancelled`, `worker_failed` | what the task did. All are `done` operations with a usage. |
+| **execution** | `stopped`, `unconfirmed` | whether yard **proved the worker stopped**. `unconfirmed` means the worker was unreachable; nothing is claimed about what it did, only about what it can still do: once the scope is revoked it can make no model call, and the VM has no other egress. |
+| **spend** | `exact`, `bounded` | `exact`: every model call was answered with a usage. `bounded`: at least one call has no answer and is charged at its reserved maximum. `charge` is the integer sum in monetary units, never below the confirmed usage. |
+
+A task is **terminal** only when its broker scope is revoked and every in-flight call is either answered or charged
+conservatively. If yard cannot reach the broker to revoke, the operation stays `running` (marked `degraded`) and its
+reservation holds; at the operation's deadline the attempt is `unknown` and settled at the whole reservation.
+
+The earlier claim that uncertainty occurs only after yard-ctl's store is lost is withdrawn. The uncertain things are:
+- **spend** of an unanswered model call (bounded, never exact), resolved if the route can say (halo's operation
+  records can; Anthropic's cannot);
+- **execution** of an unreachable worker (unconfirmed);
+- **everything**, if yard-ctl's or the broker's store is lost (the `unknown` of RFC 0007, settled at R).
+
+**Admission refusal is not execution failure.** `refused` (HTTP 4xx/503: not permitted, over the ceiling, valuation
+changed, record ceiling) and `closed`, `never_accepted`, `cancelled_before_accept` (RFC 0007) mean **not executed,
+nothing spent**. Everything else that ends a task is a typed outcome above, with a usage and whatever partial
+artifacts were captured.
+
+Guarantees in the contract (`GET /v1/yard/contract`, the shape of halo's):
 
 | Guarantee | Agent operations |
 |---|---|
-| External effects | none outside the VM, except model calls through the broker (metered). A `ReadWrite` task produces a **new workspace version**; it never changes the version it started from |
-| Repeating | spends again and may differ; a new attempt is a new VM and a new branch |
-| Deduplication | per attempt, durable in yard-ctl (not per incarnation: yard-ctl's store survives restarts) |
-| Cancel | stops the VM; the attempt ends `cancelled` with the usage metered until then |
-| Cost | **metered by the broker** (tokens per route; USD for Anthropic from its usage and a price table; engine_ms for halo); never the harness's own report |
-| Retention | the result, the transcript reference and the result version until acknowledged; the VM is gone at the end |
-| Unknown outcomes | only if yard-ctl's disk is lost. A VM or yard-node crash is a known `failed`, settled at its metered usage |
+| External effects | none outside the VM, except model calls through the broker (reserved and metered) |
+| Repeating | spends again and may differ; a new attempt is a new VM |
+| Deduplication | per attempt, durable in yard-ctl; a store loss is `unknown` |
+| Cancel | revokes the scope, stops the VM; the outcome is `cancelled` with usage to that point |
+| Cost | the broker's, in integer monetary units at the pinned valuation (section 5); never the harness's report |
+| Retention | the operation record until acknowledged; artifacts by their own leases (section 8) |
+| Valuation | the digest of the price table; pinned per attempt |
 
-**Status answers** are halo's, plus one:
-- `running`;
-- `done`, with `value`, `result_version`, usage and finish (`stop`, `budget`, `timeout`, `cancelled`, `error`);
-- `released`, `expired`, `closed`, `never_accepted`, `unknown`;
-- **`needs_input`** (proposed): the harness asked a question it may not answer itself. The cordis cell routes
-  it, then submits a new attempt with the answer.
+## 5. Valuation and budgets
 
-**Incarnation:** yard-ctl's durable epoch. It changes only on a store loss, which is the case "unknown" exists for.
+- **Operator-controlled.** The price table (price per million tokens by route and direction, a nominal price for
+  local inference per route, a price per second of VM time if the operator charges it) is the operator's. Its
+  digest is the **valuation**. An agent or a cell may choose permitted routes, smaller budgets and retry strategies;
+  it cannot change a price, and no price is derived from anything the graph holds.
+- **Pinned per attempt.** At accept, yard-ctl records the valuation in force. A submit carries the valuation the
+  outbox read from the contract; if it differs, the submit is refused (`409 valuation_changed`, not executed) and
+  the outbox re-reads. The attempt's reservation, the broker's enforcement and the settlement all use the pinned
+  table, however long the task runs.
+- **Three independent limits**, each enforced alone, none derived from another:
+  - tokens (input plus output, per route as the broker counts them),
+  - money (integer **micro-dollars**),
+  - time (seconds of wall clock, by yard-ctl against the VM allocation).
 
-## 5. The executor: yard-ctl and yard-node
+  The first reached ends the task with that outcome. A task with any of the three missing is refused.
+- **Integers only.** Prices are integer micro-dollars per million tokens; a call's cost rounds **up** to the next
+  micro-dollar. Cordis's budget unit is the micro-dollar; the conversion is done by yard, once.
 
-1. **Accept** (durable, one transaction):
-   - the task row with its digest, deadline and reservation;
-   - a broker scope (`task id`, route, cap);
-   - the workspace snapshot it reads.
-2. **Prepare (yard-node):**
-   - a zvol clone of the workspace version, read-only for `ReadOnly`;
-   - a Firecracker VM from the harness image: rootfs read-only, the zvol as `/workspace`, a tmpfs home, vsock only.
-   - P0-2 measured 126 ms to boot; the harness's own start comes on top.
-3. **Run:**
-   - The guest agent starts the harness driver.
-   - Model calls leave only through vsock to the broker, which routes, injects, meters and enforces the cap; past
-     the cap it answers 429, and the driver ends with finish `budget`.
-   - The observation stream carries the harness's events (messages, tool calls); they are observations, never
-     receipts.
-4. **Finish:**
-   - The driver writes the final result.
-   - yard-ctl validates it against `output`; on a miss it retries once, in the same VM, with the validation error.
-   - For `ReadWrite`, yard-node snapshots the zvol, and the registry records it as a new version with its base
-     and `zfs diff` summary.
-   - The VM stops, the broker scope is revoked, and the record turns `done` with the metered usage.
-5. **Restart recovery:**
-   - yard-ctl recovers its rows.
-   - A row that was running is checked with yard-node. A live VM is re-adopted; a gone one ends `failed` at the
-     metered usage.
-   - A redelivered submit for an accepted attempt is a duplicate. It **never** boots a second VM (`runsOnce`).
-6. **Placement:**
-   - Firecracker on the Halo, in `yard.slice`, capped below halo_serve. NUC jails are a later backend (AG8); yard-ctl
-     picks the backend from the task's placement class, and the contract is the same.
-   - No GPU device in the VM.
-   - The workspace dataset lives on the Halo's ZFS pool for the VM's lifetime (open question 2).
+## 6. Broker accounting: reserve, send, settle, recover
 
-## 6. Harness drivers and model routes
+The broker's meter is a durable table, one row per model call: `{call, task, route, state, reserved, confirmed}`.
 
-A driver is a small program in the image. It turns `{instructions, output schema, tools, model route}` into the
-harness's non-interactive run, and collects its final answer and event stream.
+1. **Reserve before sending.** A call's maximum cost is computed at the pinned valuation from an upper bound on its
+   input (the measured request) and the output limit the broker **imposes** on the request (`max_tokens` clamped to
+   what the remaining budget can pay for). The row is committed (`reserved`) **before** the request leaves. A call
+   whose maximum plus every other open reservation and all settled spend would pass the task's token or monetary
+   limit is answered `429` and never sent. This holds for **concurrent** calls: the check and the insert are one
+   transaction against the task's totals.
+2. **Send.** The row becomes `sent`.
+3. **Settle.**
+   - An answer with usage: the row becomes `settled` at the confirmed cost (≤ reserved); the difference is released
+     to the task's budget.
+   - A refusal by the provider before any generation (a 4xx the route documents as not-executed): `released`.
+   - Any other end (timeout, connection loss, no usage in the answer, a broker crash): the row becomes
+     `unresolved` and **keeps its reservation as the charge**. It is never released by the broker's own say-so.
+4. **Resolve, when the route can.** For halo, the broker asks the operation record for the call's usage by its
+   operation id and settles at it; for a route that cannot say, the charge stays at the reserved maximum.
+5. **Recovery.** On start the broker reads its table. `reserved` rows (a crash between commit and send): the send
+   may or may not have happened; they become `unresolved`. `sent` rows: `unresolved`. Reservations are only ever
+   released by an answer or a route's own record, never by recovery. A lost table is the `unknown` of section 4.
 
-| Driver | Run | Local route (first) | Anthropic route (second) |
+The task's `spend` is `exact` iff no row is `unresolved`, else `bounded`, and its `charge` is the sum of `settled`
+and `unresolved` reservations.
+
+## 7. The executor's internal protocol: stages, observations, fencing
+
+Acceptance, worker start, scope activation, result capture, worker termination and scope revocation are **not** one
+transaction. Each is a durable stage in the task row, entered by a request whose effect and answer may each be lost,
+duplicated or late, and left only on a **resolving observation**.
+
+| Stage | Entered by (durable first) | Resolving observation | If unknown on recovery |
 |---|---|---|---|
-| claude | Claude Code, print mode with JSON or stream-JSON output and a tool allow-list | `ANTHROPIC_BASE_URL` → broker `inference.yard` → halo `/v1/messages` | broker → Anthropic, key injected |
-| codex | Codex non-interactive exec with JSON events | broker → halo `/v1/responses` (Codex's Responses gaps, G6, apply) | — (or a brokered OpenAI route later) |
-| opencode | opencode run, JSON output | broker → halo (OpenAI-compatible) | broker → Anthropic |
-| yard-agent | yard's own loop (HARNESS J4) | broker → halo `/v1/responses` | broker → Anthropic |
+| `accepted` | one transaction: task row, digest, deadline, reservation, **pinned valuation**, the allocation record `{alloc_id, incarnation}` minted but unused | the row | none; this is the commit |
+| `scope_created` | broker scope created **inactive**, bound to `(task, alloc_id, incarnation, route, caps)` | broker scope table | create again (idempotent by task) |
+| `worker_starting` | the start request to yard-node, naming `(alloc_id, incarnation)` | yard-node's VM table by `alloc_id` | verify; **never start a second allocation for the attempt** |
+| `scope_active` | broker activates the scope for the VM's `(vsock CID, tap, incarnation)` reported by yard-node | broker scope table | re-ask |
+| `running` | the driver's first event, or the node's ready | node VM table, the stream | adopt a live allocation; a gone one goes to `capturing` with `worker_failed` |
+| `capturing` | outcome known (driver result, cap, timeout, cancel, loss) | the artifact store's content hashes | capture again from the node if reachable, else `artifacts: unavailable` |
+| `stopping` | stop request to yard-node | VM table: absent | retry; on a lease expiry the node's own watchdog stops the VM; mark `execution: unconfirmed` if the node stays unreachable past the stop bound |
+| `revoking` | broker revokes the scope; in-flight calls drained or marked `unresolved` | broker scope table: revoked | retry; non-terminal until done |
+| `settled` | the task's `spend` computed from the meter | the meter | recompute |
+| `done` | outcome, execution, spend, artifact leases, in one transaction | the row | none |
 
-- **Flag names and output formats are verified per harness version in AG1.** The table names the modes, not
-  exact flags.
-- The harnesses' own sandboxes stay on inside the VM as an inner layer. The VM is the boundary.
-- **The broker meters both routes:**
-  - Halo answers carry usage and `engine_ms`, and operations carry their own records.
-  - Anthropic answers carry usage, priced from the price-fact table (bitemporal, as halo-scope's).
+**Fencing.** The broker identifies a caller by `(vsock CID, tap)`, but both are reusable. Therefore:
+- yard-ctl mints a monotonic **allocation incarnation** and records it before it asks yard-node to start;
+- yard-node refuses a start whose incarnation is not newer than the last it saw for that CID, and attests
+  `(CID, tap, alloc_id, incarnation)` to the broker on the VM's behalf;
+- the broker admits a call only if the connection's attested tuple equals the **active scope's**; a scope is
+  activated for exactly one tuple and revoked at its end, so a later VM on the same CID and tap, an old VM that
+  outlived its scope, and a stale activation all fail the same comparison;
+- a node that cannot reach yard-ctl stops its VM at the allocation's **lease expiry** (a watchdog in the node),
+  which bounds a lost worker's life even if nothing else is reachable;
+- scope revocation does not wait for the worker: it is how a possibly-running worker is made harmless.
 
-## 7. Workspaces and apply
+Cancellation enters at any stage: it sets the task's `cancel` flag in the row, and the stages after the current one
+proceed to `capturing` with outcome `cancelled`. A cancel before `accepted` commits is `cancelled_before_accept`.
 
-- **Versions:** a version is a ZFS snapshot plus a registry row `{repo, version, base, produced_by, diff summary}`.
-  A task reads one version and, if `ReadWrite`, returns one new version. Nothing writes a version in place.
-- **Apply** is an operation of its own: `workspace.apply(result, expected_base)`.
-  - It succeeds only if the target branch is still at `expected_base`. Otherwise it is `conflict`: the workflow
-    rebases with a new task or asks.
-  - It needs an **approval** bound to `(result version, expected base, diff digest)`:
-    - a card on the approval page, showing the diff from the registry and never the agent's description of it;
-    - the passkey for anything the policy marks sensitive;
-    - an expiry, after which the apply is refused, never run on a late approval (WARDEN, A2A R11).
-- **Automated approval, later:**
-  - A cordis approval harness is a cordis workflow: critics, tests in their own agent task, deciders. It approves
-    a result by a recorded, scored decision.
-  - Once it exists and passes its own test suite (an evaluation set of good and bad diffs with known answers),
-    the runner config may enable it for a named cell, with that cell's limits.
-  - The card path stays for every other cell, and for anything the policy marks sensitive.
+## 8. Artifacts: retention separate from acknowledgement
 
-## 8. Identity
+Acknowledging an operation releases **the operation's record and its receipt capture**. It does not release an
+artifact. Artifacts are `{id, digest, size, kind, lease}` where `kind` is `transcript`, `findings`, `invalid_output`,
+`partial`, `meter`, `stage_log`, or (deferred) `candidate_workspace`.
 
-- **The task runs as a yard session:** an STS token with `sub` = the user and `act` = the sandbox session, and
-  inside that the cordis principal that submitted the operation (IDENTITY's RFC 8693 shape).
-- **The broker scope is minted for the task** and revoked at its end. A model call after the end is refused
-  (`noCallsAfterEnd`).
-- The VM holds no credential; the broker identifies it by its vsock CID and tap.
+- Each artifact has an **explicit lease** (`expires_at`, in yard-ctl's clock) and **holders**. Capture sets a default
+  lease from the operator's retention policy.
+- A holder (an approval record, an open review, a cell) extends or releases its hold with `artifact.lease(id,
+  until)`. An artifact lives until its last hold and lease have both ended.
+- **Unavailable is an explicit failure.** Fetching an artifact whose lease ended or whose bytes are lost answers
+  `410 artifact_unavailable` with the digest it should have had. A consumer that needed it (an approval, an audit)
+  fails; it is never given an empty or substitute value.
+- Retention is quota-bounded per owner; a refusal to extend a lease is a typed error, not an eviction.
 
-## 9. Agent operations and A2A-MCP
+## 9. Completion is not acceptance
 
-A2A-MCP.md designs **east-west** calls: one sandbox calling another, through `yard-relay`, as A2A tasks or MCP
-calls, with suspension, wakes, chain limits and an ambiguity register (R1–R17). This draft is **north-bound**: a
-workflow delegating to yard. They meet, and they must not become two state machines for one call.
+- **Yard validates structure**: the final output parses and matches the declared output schema.
+- It **preserves** an output that does not as an `invalid_output` artifact and ends the task with that outcome.
+  There is **no automatic retry**, no hidden second model call inside validation.
+- **Repair is explicit**: a repair is a *new attempt* a cell emits (with the invalid output and the error as its
+  input), under its own reservation and metering. Yard offers no in-VM repair loop.
+- **Cordis evaluates acceptance**: whether findings cite files and lines that exist in the reviewed version,
+  whether a zero-finding review read anything, whether the verdict is consistent. Yard never decides that a
+  result is good.
 
-- **The contract cordis sees is RFC 0007's,** because cordis's outbox already implements it (journal, receipts,
-  commit-before-ack), and the halo milestone proved it end to end.
-- **Inside yard, a task whose agent is an A2A server** (yard-agent, or a harness behind an A2A wrapper) is driven
-  as an A2A task through the relay. The operation's attempt id is the A2A `messageId`, its idempotency key. The
-  relay's ambiguity register (R5, R9, R12, R15) applies inside yard, and the operation status is derived from it:
+## 10. Harness drivers and routes
 
-| A2A task / relay | Operation status |
+The first driver is `claude` (Claude Code, print mode, JSON output) against halo's `/v1/messages` through the
+broker. A driver turns `{instructions, output schema, tools, route}` into the harness's non-interactive run.
+- **Tools: Read, Grep, Glob only.** No shell, no write, no web, **no native subagents** (the harness's Task tool is
+  disabled in the driver's configuration, and the VM has nothing a subagent could add).
+- Flag names and output formats are verified per harness version (AG1); the driver pins the version and flags and
+  records them in the stage log.
+- The harness's own sandbox stays on as an inner layer; the VM is the boundary.
+- Metering is the broker's. Halo answers carry usage and `engine_ms`; Anthropic answers (later) are priced from the
+  price-fact table at the pinned valuation.
+
+## 11. Workspaces (the immutable base, and diffs)
+
+- **Base.** A workspace version is an immutable ZFS snapshot plus a registry row `{repo, version, base, produced_by}`.
+  Many tasks may attach the **same snapshot read-only** (no clone per task for a read-only task; a clone only when a
+  task writes, which is deferred). Nothing writes a version in place.
+- **Diffs are computed by a trusted tool over the actual trees**, not with `zfs diff`. `zfs diff` reports changed
+  blocks and paths of a ZFS *filesystem*; a zvol holds a guest filesystem, so it exposes nothing about files. The
+  comparison is made as follows, and is needed from the first writer on:
+  - a **diff worker**: a separate, minimal Firecracker VM with the base and result volumes attached read-only (the
+    host never mounts a guest-written filesystem), running a vetted tool that walks both trees without following
+    symlinks;
+  - the tool emits a **canonical manifest**: for every path in either tree, its type (file, directory, symlink,
+    special), mode, owner policy, size, content hash, and, for a symlink, its target string; deletions and type
+    changes are entries; renames are not inferred;
+  - the **tree digest** is a Merkle hash of the manifest; the **diff digest** is the hash of the sorted manifest
+    delta; the text diff shown to a person is derived from the same walk, for regular text files, and says "binary"
+    with the hash otherwise;
+  - an approval binds to `(base tree digest, result tree digest, diff digest)`; apply recomputes the result tree
+    digest.
+
+## 12. Deferred, and what must be written first
+
+None of these is in the first milestone. Each needs its own state, budget and cancellation semantics.
+
+| Deferred | Must specify before it is built |
 |---|---|
-| SUBMITTED, WORKING | `running` |
-| COMPLETED (stored at the relay) | `done` |
-| INPUT_REQUIRED | `needs_input` |
-| CANCELED | `done` with finish `cancelled` |
-| FAILED, REJECTED | `done` with finish `error` |
-| unknown (R5, R12, R15) | `failed` with metered usage when the VM is known gone; `unknown` only if yard-ctl's store was lost |
+| **`ReadWrite` tasks and candidate workspaces** | the clone's lifecycle and lease; the writer's quota; the trusted diff (section 11); artifact kind `candidate_workspace` |
+| **Approval and apply** | **Approval is a durable record**, produced by a person or an approval harness and bound to `(candidate digest, expected base, diff digest, expiry)`; it is not an open operation. **Apply is a short compare-and-set operation** that carries the approval id and validates: the caller's authority, the approval's expiry, the candidate's digest and lease, the target head equal to the expected base. Waiting for a human is never an operation's `running` |
+| **Interactive continuation (`needs_input`)** | whether a VM is held suspended or a new attempt carries the answer; budget and lease for the wait; cancellation. Until then a task returns `insufficient` |
+| **A2A child delegation** | the child's budget drawn from the parent's reservation and metered into its spend; cancellation propagation; the chain limits; the ambiguity register's rows for it (A2A-MCP R5, R9, R12, R15). Until then Cordis coordinates top-level fan-out |
+| **Anthropic route** | price facts at the valuation; the USD limit; unresolvable unanswered calls charged at their maxima (section 6) |
+| **Codex, opencode, yard-agent drivers** | each driver's pinned flags, output format and event stream; metering parity |
 
-- **CLI harnesses** (Claude Code, Codex, opencode) are driven directly by their driver in the VM; there is no A2A
-  server to talk to.
-- **An agent that delegates further** (Claude in a task calling Codex) does so as an **A2A edge through the
-  relay**:
-  - the edge policy, cards and chain limits (D6, D10) apply;
-  - the chain's budget is drawn from the parent task's reservation;
-  - the child is metered into the parent's usage.
+## 13. Identity
 
-  It is never a nested cordis operation the agent can submit itself. Agents get no outbox.
+- The task runs as a yard session: an STS token with `sub` = the user and `act` = the sandbox session, and inside
+  that the cordis principal that submitted the operation (IDENTITY's RFC 8693 shape).
+- The broker scope is minted for the task, bound to the allocation tuple, and revoked at its end.
+- The VM holds no credential.
 
-## 10. Observability and training data
+## 14. Observability
 
-Every agent task is a run (TRAINING-DATA):
-- one trace, with spans for model calls (through the broker), tool calls (with snapshot ids), the driver's
-  validation and the apply;
-- content capture by run class (`own-code` on; anything web- or secret-touching digest-only).
+Every task is a run (TRAINING-DATA): a trace with spans for model calls (through the broker, with the reservation
+and settlement), the stage transitions, the driver's validation, and the artifacts. The cordis verdict and whether
+a review was later overturned are recorded as score facts. Content capture follows the run class.
 
-The signals:
-- the cordis verdict (did the review match the eventual outcome);
-- the approval decision on the apply card, and the user's edit of the agent's diff before applying (a preference
-  pair);
-- for reviews, whether the critic's verdict was overturned.
+## 15. Models
 
-All are recorded as score facts with supersede and retract.
+`spec/agentop/` (quint 0.32, seed 0x5eed, 10,000 samples × 40 steps, and the deep runs) is **evidence under these
+assumptions, which are narrower than this revision's protocol**:
+- every model call is **atomic, answered, and of known cost**: it either does not happen or happens once with an
+  exact usage;
+- calls are **not concurrent** within a task's accounting step;
+- the **worker stop is reliable** and observed, and revocation is **instantaneous** with the task's end;
+- there are **no broker crashes** and no lost usage answers; the broker's table is never behind the provider;
+- a VM's identity is not reusable (no CID reuse, no stale activation);
+- artifacts are not modelled; apply and approval are (and are deferred in this revision).
 
-## 11. Ambiguity register (agent-specific; the wire's are RFC 0007's, the relay's A2A-MCP's)
+What it does show, under those assumptions: the cap, meter-not-report, restart adoption, revocation at the end,
+approval before apply, and compare-and-set apply each hold, and each mutant breaks its property.
 
-| # | Call | done / not done / unknown | Settle bound | Resolving observation | Rule | Mutant |
-|---|---|---|---|---|---|---|
-| G1 | yard-ctl → yard-node: start the VM | done: the VM reports ready. Not done: refused (capacity). Unknown: lost answer | the boot bound (~1 s) + the harness start | yard-node's VM table by task id | verify, never start a second one for the attempt | `rerunOnRestart` |
-| G2 | broker model call | done: answered and metered. Not done: refused (cap, scope). Unknown: lost answer | the call timeout | the broker's meter row | **charge what the meter says**; the harness's report is advisory | `meterFromHarness` |
-| G3 | the task's end → scope revoke | done: revoked | immediate (same transaction as `done`) | the broker's scope table | revoke before the record turns done | `scopeNotRevoked` |
-| G4 | apply | done: the branch moved to the result. Not done: conflict, denied, expired. Unknown: lost answer | the apply's own bound | the branch head | verify the head; apply is a compare-and-set on `expected_base` | `applyStaleBase` |
-| G5 | approval | done: approved (hash-bound). Not done: denied, expired | the card expiry | the card | wait, then refused; a late approval never releases it | `applyWithoutApproval`, `autoApproveUnconfigured` |
+**To model before Y1's recovery is built** (`spec/agentop/accounting.qnt` and `spec/agentop/stages.qnt`, with
+gate rows, mutants and witnesses):
 
-## 12. The model (`spec/agentop/`)
+| Extension | Properties | Mutants |
+|---|---|---|
+| Concurrent reservations | `reservedBeforeSend`; `withinCap` over reserved plus settled across concurrent calls | `reserveAfterSend`, `checkThenInsert` (the cap check not in the insert's transaction) |
+| Lost usage answers | `neverUndercharged`: charge ≥ real spend; `unresolvedKeepsCharge` | `releaseOnTimeout`, `chargeZeroOnLoss` |
+| Broker crashes | recovery never releases a reservation; `spendBounded` after a crash between reserve and send | `recoverReleases`, `recoverTrustsHarness` |
+| Ambiguous worker start and stop | `runsOnce`; `noSecondAllocation`; a lost stop answer resolves by observation | `rerunOnRestart` (existing), `startWithoutIncarnation` |
+| Delayed revocation | `noCallAfterRevoke` over the window between a worker's death and the revoke; stale incarnation never admitted | `scopeNotRevoked` (existing), `cidReuse`, `activateWithoutAttestation` |
+| Artifacts | `noReleaseWhileHeld`; `unavailableIsExplicit` | `ackReleasesArtifact`, `substituteEmpty` |
 
-**Scope:** what agents add beyond RFC 0007's wire, whose models (halo `spec/operation`, cordis `operation.qnt`,
-`capture.qnt`, `expiry.qnt`) already cover delivery, identity, deadlines and the handoff. The actors:
-- a durable executor that restarts;
-- VMs that crash;
-- a broker that meters, caps and revokes;
-- a harness that makes model calls and reports its own usage, possibly wrong;
-- workspace versions and `apply`;
-- an approver: the user, or a cell's automated approval when it is enabled and its harness is tested.
+Witnesses: an unanswered call charged at its maximum; a broker crash with a `sent` row; a worker lost with its
+node unreachable (`execution: unconfirmed`, spend `bounded`); a stale-incarnation call refused; an artifact fetched
+after its lease with an explicit failure.
 
-**Properties:**
-- `accounted`: real model spend ≤ settled + reserved;
-- `withinCap`: no task spends past its budget;
-- `runsOnce`: one VM per attempt;
-- `noApplyWithoutApproval`;
-- `noLostUpdate`: the main line only moves by an apply from its current head;
-- `appliedOnce`;
-- `noCallsAfterEnd`.
-
-**Mutants, one per rule:**
-- `brokerNoCap`;
-- `meterFromHarness`;
-- `rerunOnRestart`;
-- `scopeNotRevoked`;
-- `applyWithoutApproval`;
-- `autoApproveUnconfigured` (auto-approval on a cell whose harness is not tested, or not enabled for it);
-- `applyStaleBase`.
-
-**Results** (`spec/agentop/run.sh`, quint 0.32, seed 0x5eed, 10,000 samples × 40 steps):
-- **The design holds** in all three approval configurations:
-  - today's (`design`: automated approval enabled nowhere);
-  - `enabledUntested` (a cell enables it before its harness passed: still the user only);
-  - `autoConfigured` (enabled and tested).
-
-  Both `design` and `autoConfigured` also hold at 100,000 × 80.
-- **Each mutant breaks its property:** `brokerNoCap` withinCap; `meterFromHarness` accounted; `rerunOnRestart`
-  runsOnce; `scopeNotRevoked` noCallsAfterEnd; `applyWithoutApproval` noApplyWithoutApproval;
-  `autoApproveUnconfigured` noAutoUnlessConfigured; `applyStaleBase` noLostUpdate.
-- **Every witness is reached:**
-  - an applied result and a settled review;
-  - a cap hit, and a crashed task settled at its meter;
-  - a restart that re-adopted a running task;
-  - an apply conflict, and a denial;
-  - an automated apply on the configured cell.
-
-Details are in `spec/agentop/results.txt`.
-
-## 13. Milestones
+## 16. Milestones
 
 | # | Work | Exit |
 |---|---|---|
-| **AG0** | This draft and `spec/agentop` | The design holds; each mutant breaks its property; every witness is reached |
-| **AG1** | Firecracker harness image: the P0-2 guest plus node, Claude Code, ripgrep, git; the guest agent's exec and vsock broker forward; the claude driver | `claude` in print mode, in the VM, reviews a fixture repo against halo `/v1/messages` through the broker. Measured: boot to first model call; the review's wall time vs the same outside the VM |
-| **AG2** | yard-ctl serves `/v1/operations` for `api: "agent"`: durable rows, zvol clones, scopes, recovery | halo's `tools/op_fault_probe.py`, adapted to agent tasks, passes, including a yard-ctl restart mid-task and a killed VM |
-| **AG3** | cordis `agent.run` through the outbox adapter (one adapter, two executors); the `claude_review` cell | A cordis review loop with `claude_review` against the local model ships through the milestone's faults |
-| **AG4** | `ReadWrite` tasks, versions, `workspace.apply` with approval cards | An implement-then-review workflow produces a branch; the apply raises a card; approve applies it; deny and expire refuse; a moved base conflicts |
-| **AG5** | The brokered Anthropic route; price facts; the USD cap | The same review on the Anthropic route, metered in USD; the cap stops a runaway task |
-| **AG6** | Codex and opencode drivers (and yard-agent when J4 lands) | The review cell runs on each, through the same contract |
-| **AG8** | The NUC jail backend (Linux compatibility, SANDBOX-LINUX option E): its harness spikes, then the same AG2 tests on it | The review cell runs on either backend through the same contract; placement is a per-task class |
-| **AG7** | The cordis approval harness and its evaluation set; per-cell enablement in the runner config | The harness scores at least the agreed bar on held-out diffs; enabling it for one cell auto-applies there and nowhere else |
+| **Y0** | This revision; the extended models of section 15 with their gate rows | The design holds under the stated assumptions; each mutant breaks its property; each witness is reached |
+| **Y1a** | The review VM alone: Firecracker image with the claude driver, read-only base attach, broker with the reservation table, yard-ctl stages, artifacts and leases; operations served for `api: "agent"` | one review task against halo with limits, evidence, cancellation; the **fault set**: yard-ctl restart at every stage, broker crash between reserve and send, lost usage answer, killed VM, unreachable node (lease expiry), stale activation, cancel at every stage, lease expiry; halo's `tools/op_fault_probe.py` adapted to agent tasks |
+| **Y1b** | Cordis connection: the outbox's yard adapter and a `claude_review` cell | a cordis review loop ships through the milestone's faults, with the evidence manifest |
+| **Y2** | Measured optimisations (section 17) | each reported with its measurement |
+| **Later** | The deferred list of section 12, each when its semantics are written | |
 
-## 14. Open questions
+## 17. What to measure, not guess
 
-1. `needs_input`: route a harness's question to the cell (a new attempt with the answer), or hold the VM
-   suspended for an answer (SR2 snapshot)? The draft proposes a new attempt, which keeps VMs short-lived.
-2. Where workspace versions live when the VM is on the Halo:
-   - the Halo's pool, with `zfs send` to the NUC for retention and other nodes;
-   - or the NUC's, with the zvol sent to the Halo per task.
+VM boot (126 ms, P0-2) is small against a task of minutes, and is not a target. The candidates, each measured before
+it is optimised:
+- **Immutable workspace sharing**: one read-only snapshot attached to N concurrent reviewers versus a clone each:
+  attach time, page-cache sharing, storage.
+- **Stable prompt prefixes**: the instruction text ordered so the shared part (rules, tool descriptions) is a prefix
+  and halo's prefix cache hits across reviewers: cache hit rate, time to first token.
+- **Harness startup**: Claude Code process start to first model call, with the image's node and caches.
+- **Interference with halo_serve**: CPU, memory and storage I/O from N VMs in `yard.slice` against halo's
+  throughput and latency (the GPU is shared through halo's scheduler, where an agent's calls are ordinary requests
+  under the task's principal).
 
-   The draft proposes the Halo's, since the VM and the zvol must be co-located.
-3. A deadline for `ReadWrite` results: an approval card's expiry vs the result's retention. The draft proposes
-   retention until acknowledged, as for every operation, with the card expiring sooner.
-4. Concurrency on the Halo: how many agent VMs beside halo_serve. Each VM costs 1-2 GiB and CPU in `yard.slice`;
-   the GPU is shared through halo's scheduler, where an agent's model calls are ordinary requests under the task's
-   principal (G3 fairness applies).
+## 18. Open questions
+
+1. The monetary value of **local inference** (a nominal price per token or per engine second): the operator's
+   choice, but needed so a local review has a comparable budget.
+2. The **stop bound** and the **lease length** for an allocation: how long a lost worker may live.
+3. Whether halo's operation records give the broker enough to **resolve** an unanswered call's usage exactly.
+4. The default **artifact lease** and per-owner quota.
+5. Where the **diff worker** runs (its own VM image, its own slice).
+6. Where workspace versions live when the VM is on the Halo (the Halo's pool, with `zfs send` for retention) —
+   unchanged from revision 1.
+
+## History
+
+- Revision 1 (2026-10-12): first draft.
+- Revision 2 (2026-10-13): after review. Status separated from accounting certainty; broker reserve/settle/recover
+  protocol; operator valuation pinned per attempt, three independent limits, integer micro-dollars; typed terminal
+  outcomes; staged recovery and fencing by allocation incarnation; artifact leases; trusted tree comparison replaces
+  `zfs diff`; structural validation only, explicit repair; approval separated from apply; `needs_input` and A2A
+  delegation deferred; models restated as evidence under assumptions with the extensions named; one read-only
+  review task first; measured optimisation.
